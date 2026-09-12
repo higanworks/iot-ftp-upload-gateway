@@ -1,0 +1,32 @@
+# iot-ftp-upload-gateway 設定サンプル
+#
+# ここに書いた値は環境変数で上書きできる（環境変数が最優先）。
+# 対応する環境変数名:
+#   GATEWAY_LISTEN_ADDRESS
+#   GATEWAY_LISTEN_PORT
+#   GATEWAY_PASSIVE_ADDRESS
+#   GATEWAY_PASSIVE_PORT_RANGE_START
+#   GATEWAY_PASSIVE_PORT_RANGE_END
+#   GATEWAY_BACKENDS                 (例: "ftp01:21,ftp02:21")
+#   GATEWAY_CONNECTION_TIMEOUT_SECS
+#   GATEWAY_IDLE_TIMEOUT_SECS
+
+listen:
+  address: 0.0.0.0
+  port: 21
+
+passive:
+  address: 0.0.0.0
+  port_range:
+    start: 10000
+    end: 20000
+
+backends:
+  - host: ftp01
+    port: 21
+  - host: ftp02
+    port: 21
+
+timeouts:
+  connection_timeout_secs: 10
+  idle_timeout_secs: 300
