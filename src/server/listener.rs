@@ -37,7 +37,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             }
 
             accept_result = listener.accept() => {
-                let (stream, peer_addr) = accept_result?;
+                // A transient accept() failure (e.g. the host is temporarily out of file
+                // descriptors) must not take down the whole gateway and every other
+                // in-flight session with it -- log it and keep accepting.
+                let (stream, peer_addr) = match accept_result {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "failed to accept connection");
+                        continue;
+                    }
+                };
                 tracing::info!(%peer_addr, "accepted new connection");
 
                 let backend = backend_selector.next();

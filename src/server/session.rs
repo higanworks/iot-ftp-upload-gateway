@@ -1,5 +1,6 @@
+use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -17,6 +18,49 @@ use crate::protocol::reply;
 struct DataChannel {
     client_data: TcpStream,
     backend_data: TcpStream,
+}
+
+/// Treats an I/O failure on the *client* connection as a normal disconnect (PROJECT_ADDITION.ja.md
+/// section 2: on an unreliable mobile network, connection loss is expected, not exceptional).
+/// Logs at INFO and ends the session immediately rather than propagating as an error.
+macro_rules! client_io {
+    ($expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::info!(error = %err, "client disconnected");
+                return Ok(());
+            }
+        }
+    };
+}
+
+/// Treats an I/O failure or timeout talking to the *backend* as a backend-side problem: unlike
+/// the client, the backend is our own infrastructure, so this is logged at WARN.
+macro_rules! backend_io {
+    ($expr:expr) => {
+        match $expr {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, "backend connection failed");
+                return Ok(());
+            }
+        }
+    };
+}
+
+async fn read_line_with_timeout(
+    conn: &mut BufReader<TcpStream>,
+    line: &mut String,
+    timeout: Duration,
+) -> io::Result<usize> {
+    match tokio::time::timeout(timeout, conn.read_line(line)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for backend reply",
+        )),
+    }
 }
 
 /// `peer_addr` and the selected backend are recorded on the span so every log line emitted
@@ -39,6 +83,8 @@ pub async fn handle(
 
     let connection_timeout = Duration::from_secs(timeouts.connection_timeout_secs);
     let idle_timeout = Duration::from_secs(timeouts.idle_timeout_secs);
+    let command_timeout = Duration::from_secs(timeouts.command_timeout_secs);
+    let data_idle_timeout = Duration::from_secs(timeouts.data_idle_timeout_secs);
 
     let backend_stream =
         match backend::connection::connect(&backend_config, connection_timeout).await {
@@ -57,10 +103,16 @@ pub async fn handle(
 
     // Relay the backend's initial banner to the client as-is.
     let mut line = String::new();
-    let banner_bytes = backend_conn.read_line(&mut line).await?;
-    if banner_bytes > 0 {
-        client_conn.write_all(line.as_bytes()).await?;
+    let banner_bytes =
+        backend_io!(read_line_with_timeout(&mut backend_conn, &mut line, command_timeout).await);
+    if banner_bytes == 0 {
+        tracing::warn!("backend closed connection unexpectedly");
+        let _ = client_conn
+            .write_all(b"421 Service not available\r\n")
+            .await;
+        return Ok(());
     }
+    client_io!(client_conn.write_all(line.as_bytes()).await);
 
     loop {
         line.clear();
@@ -68,8 +120,9 @@ pub async fn handle(
             biased;
 
             control_result = client_conn.read_line(&mut line) => {
-                let bytes_read = control_result?;
+                let bytes_read = client_io!(control_result);
                 if bytes_read == 0 {
+                    tracing::info!("client disconnected");
                     break;
                 }
 
@@ -94,14 +147,16 @@ pub async fn handle(
                             } else {
                                 reply::pasv_reply(passive_config.address, port)
                             };
-                            client_conn.write_all(response.as_bytes()).await?;
+                            client_io!(client_conn.write_all(response.as_bytes()).await);
                             active_pasv = Some(guard);
                         }
                         None => {
                             tracing::warn!("PASV port pool exhausted");
-                            client_conn
-                                .write_all(b"425 Can't open data connection\r\n")
-                                .await?;
+                            client_io!(
+                                client_conn
+                                    .write_all(b"425 Can't open data connection\r\n")
+                                    .await
+                            );
                         }
                     }
                     continue;
@@ -129,11 +184,11 @@ pub async fn handle(
                             }
                         }
                         Ok(Err(err)) => {
-                            tracing::warn!(error = %err, "failed to accept data connection");
+                            tracing::info!(error = %err, "client failed to open data connection");
                             None
                         }
                         Err(_) => {
-                            tracing::warn!("timed out waiting for client to open the data connection");
+                            tracing::info!("client never opened the data connection (timed out)");
                             None
                         }
                     };
@@ -141,64 +196,81 @@ pub async fn handle(
                     tracing::info!(port, "PASV port released");
 
                     if let Some(mut channel) = channel {
+                        let upload_start = Instant::now();
                         tracing::info!(%filename, "upload started");
 
-                        backend_conn.write_all(line.as_bytes()).await?;
+                        backend_io!(backend_conn.write_all(line.as_bytes()).await);
 
                         let mut backend_reply = String::new();
-                        let reply_bytes = backend_conn.read_line(&mut backend_reply).await?;
+                        let reply_bytes = backend_io!(
+                            read_line_with_timeout(&mut backend_conn, &mut backend_reply, command_timeout).await
+                        );
                         if reply_bytes == 0 {
                             tracing::warn!("backend closed connection unexpectedly");
                             break;
                         }
-                        client_conn.write_all(backend_reply.as_bytes()).await?;
+                        client_io!(client_conn.write_all(backend_reply.as_bytes()).await);
 
                         // Move the file bytes only after the backend confirmed it is ready (150).
-                        match relay::relay_bidirectional(&mut channel.client_data, &mut channel.backend_data).await {
+                        let relay_result = relay::relay_bidirectional(
+                            &mut channel.client_data,
+                            &mut channel.backend_data,
+                            data_idle_timeout,
+                        )
+                        .await;
+                        match relay_result {
                             Ok((bytes_uploaded, _)) => {
                                 tracing::info!(%filename, bytes_uploaded, "upload data transferred");
                             }
                             Err(err) => {
-                                tracing::warn!(%filename, error = %err, "upload failed: data relay error");
+                                let duration_ms = upload_start.elapsed().as_millis();
+                                tracing::warn!(%filename, error = %err, duration_ms, "upload failed: data relay error");
                             }
                         }
                         tracing::info!(%filename, "data connection closed");
 
                         let mut completion = String::new();
-                        let completion_bytes = backend_conn.read_line(&mut completion).await?;
+                        let completion_bytes = backend_io!(
+                            read_line_with_timeout(&mut backend_conn, &mut completion, command_timeout).await
+                        );
                         if completion_bytes == 0 {
                             tracing::warn!("backend closed connection unexpectedly");
                             break;
                         }
                         let completion_trimmed = completion.trim_end_matches(['\r', '\n']);
+                        let duration_ms = upload_start.elapsed().as_millis();
                         if completion_trimmed.starts_with('2') {
-                            tracing::info!(%filename, reply = %completion_trimmed, "upload finished");
+                            tracing::info!(%filename, reply = %completion_trimmed, duration_ms, "upload finished");
                         } else {
-                            tracing::warn!(%filename, reply = %completion_trimmed, "upload failed");
+                            tracing::warn!(%filename, reply = %completion_trimmed, duration_ms, "upload failed");
                         }
-                        client_conn.write_all(completion.as_bytes()).await?;
+                        client_io!(client_conn.write_all(completion.as_bytes()).await);
                         continue;
                     }
 
                     // Could not establish the data connection; let the client know and move on
                     // rather than forwarding STOR to a backend that never got its own PASV.
-                    client_conn
-                        .write_all(b"425 Can't open data connection\r\n")
-                        .await?;
+                    client_io!(
+                        client_conn
+                            .write_all(b"425 Can't open data connection\r\n")
+                            .await
+                    );
                     continue;
                 }
                 // If this was a STOR without a PASV port allocated, fall through and let
                 // the backend respond with its own error (e.g. "425 Use PASV first").
 
-                backend_conn.write_all(line.as_bytes()).await?;
+                backend_io!(backend_conn.write_all(line.as_bytes()).await);
 
                 let mut backend_reply = String::new();
-                let reply_bytes = backend_conn.read_line(&mut backend_reply).await?;
+                let reply_bytes = backend_io!(
+                    read_line_with_timeout(&mut backend_conn, &mut backend_reply, command_timeout).await
+                );
                 if reply_bytes == 0 {
                     tracing::warn!("backend closed connection unexpectedly");
                     break;
                 }
-                client_conn.write_all(backend_reply.as_bytes()).await?;
+                client_io!(client_conn.write_all(backend_reply.as_bytes()).await);
             }
 
             _ = tokio::time::sleep(idle_timeout) => {

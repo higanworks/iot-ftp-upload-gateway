@@ -79,6 +79,12 @@ pub struct BackendConfig {
 pub struct TimeoutConfig {
     pub connection_timeout_secs: u64,
     pub idle_timeout_secs: u64,
+    /// How long to wait for the backend to reply to a forwarded control command.
+    pub command_timeout_secs: u64,
+    /// How long the data relay may go with zero bytes moved in either direction before it is
+    /// considered stalled. This is inactivity-based, not a cap on total transfer time, so a
+    /// slow-but-active upload over a mobile network is never penalized.
+    pub data_idle_timeout_secs: u64,
 }
 
 impl Default for TimeoutConfig {
@@ -86,6 +92,8 @@ impl Default for TimeoutConfig {
         TimeoutConfig {
             connection_timeout_secs: 10,
             idle_timeout_secs: 300,
+            command_timeout_secs: 30,
+            data_idle_timeout_secs: 60,
         }
     }
 }
@@ -139,6 +147,15 @@ impl Config {
         if let Some(v) = env_var("GATEWAY_IDLE_TIMEOUT_SECS")? {
             self.timeouts.idle_timeout_secs =
                 v.parse().context("invalid GATEWAY_IDLE_TIMEOUT_SECS")?;
+        }
+        if let Some(v) = env_var("GATEWAY_COMMAND_TIMEOUT_SECS")? {
+            self.timeouts.command_timeout_secs =
+                v.parse().context("invalid GATEWAY_COMMAND_TIMEOUT_SECS")?;
+        }
+        if let Some(v) = env_var("GATEWAY_DATA_IDLE_TIMEOUT_SECS")? {
+            self.timeouts.data_idle_timeout_secs = v
+                .parse()
+                .context("invalid GATEWAY_DATA_IDLE_TIMEOUT_SECS")?;
         }
         Ok(())
     }

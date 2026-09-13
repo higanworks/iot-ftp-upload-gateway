@@ -1,8 +1,8 @@
 # iot-ftp-upload-gateway
 
 A minimal FTP gateway, written in Rust, that accepts plain FTP uploads from IoT devices
-(USER/PASS/PASV/STOR) and relays them to one of several backend FTP servers. It exists to let
-FTP-only IoT devices upload through AWS Network Load Balancer / Kubernetes Service without
+(USER/PASS/PASV/EPSV/STOR) and relays them to one of several backend FTP servers. It exists to
+let FTP-only IoT devices upload through AWS Network Load Balancer / Kubernetes Service without
 publishing a huge PASV port range per backend, and without running a general-purpose FTP proxy.
 
 See [PROJECT.ja.md](PROJECT.ja.md) (Japanese) for the full design rationale and scope.
@@ -10,9 +10,15 @@ See [PROJECT.ja.md](PROJECT.ja.md) (Japanese) for the full design rationale and 
 ## Scope
 
 Only the commands an IoT device needs to upload a file are implemented: `USER`, `PASS`,
-`SYST`, `TYPE`, `PWD`, `CWD`, `PASV`, `STOR`, `QUIT`, `NOOP`. IPv4 and passive mode only;
-no FTPS/TLS, no Active mode, no IPv6, no general FTP command support (`RETR`, `LIST`, `PORT`,
-etc. are not implemented).
+`SYST`, `TYPE`, `PWD`, `CWD`, `PASV`, `EPSV`, `STOR`, `QUIT`, `NOOP`. IPv4 and passive mode
+only; no FTPS/TLS, no Active mode, no IPv6, no general FTP command support (`RETR`, `LIST`,
+`PORT`, etc. are not implemented).
+
+`EPSV` (RFC 2428) is accepted alongside `PASV` and shares the exact same port pool and data
+relay — some clients (and any client whose control connection happens to be IPv6, since PASV's
+reply format can't represent an IPv6 address) prefer or require it. Unlike PASV's reply, EPSV's
+`229` reply carries no address — the client is expected to reuse the control connection's
+address — so it isn't affected by the PASV bind-vs-advertise distinction described below.
 
 ## Build
 
@@ -46,9 +52,17 @@ config file and overridden per-environment via env vars.
 | Backend servers | `backends` | `GATEWAY_BACKENDS` (`host:port,host:port`) |
 | Backend connect timeout (secs) | `timeouts.connection_timeout_secs` | `GATEWAY_CONNECTION_TIMEOUT_SECS` |
 | Control connection idle timeout (secs) | `timeouts.idle_timeout_secs` | `GATEWAY_IDLE_TIMEOUT_SECS` |
+| Backend command response timeout (secs) | `timeouts.command_timeout_secs` | `GATEWAY_COMMAND_TIMEOUT_SECS` |
+| Data connection idle timeout (secs) | `timeouts.data_idle_timeout_secs` | `GATEWAY_DATA_IDLE_TIMEOUT_SECS` |
 
 Backends are selected round-robin per session; a session's control connection and any PASV
 data connections always stay on the same backend for the lifetime of that session.
+
+`data_idle_timeout_secs` is inactivity-based, not a cap on total transfer time: the timer
+resets on every byte moved in either direction during a `STOR`. This matters for IoT devices on
+mobile networks, which can have long stretches of low throughput without the connection actually
+being dead — a slow-but-active upload is never cut off, but a connection that goes completely
+silent is detected and cleaned up rather than held open (and its PASV port leaked) forever.
 
 **Important:** `passive.address` / `GATEWAY_PASSIVE_ADDRESS` is only the address advertised to
 clients in the PASV reply — it is *not* the bind address. The PASV data listener always binds
@@ -59,8 +73,8 @@ targets.
 
 ## Docker
 
-Multi-stage build producing a static (musl) binary on a `distroless/static` base — no shell,
-no package manager, runs as a non-root user.
+Multi-stage build producing a glibc-linked binary on a `distroless/cc` base — no shell, no
+package manager, runs as a non-root user.
 
 ```sh
 docker build -t iot-ftp-upload-gateway .
@@ -85,8 +99,54 @@ Graceful shutdown: the gateway stops accepting new connections on SIGTERM/SIGINT
 30s) for in-flight sessions to finish on their own, then exits — compatible with `docker stop`
 and ECS task termination.
 
+### Production deployment on EC2 (host networking)
+
+`docker-compose.yml`'s bridge network with static IPs is a Docker-Desktop-for-Mac workaround for
+local testing only, where the gateway and its backends can't share the host's loopback the way
+they can on real Linux. On EC2, use `network_mode: host` so the gateway listens directly on the
+host's network — no port mapping needed, and `GATEWAY_PASSIVE_ADDRESS` should be the EC2
+instance's own address:
+
+```yaml
+services:
+  gateway:
+    build: .
+    network_mode: host
+    environment:
+      GATEWAY_BACKENDS: "ftp01:21,ftp02:21"
+      GATEWAY_PASSIVE_ADDRESS: "<EC2 instance address>"
+      GATEWAY_PASSIVE_PORT_RANGE_START: "10000"
+      GATEWAY_PASSIVE_PORT_RANGE_END: "20000"
+```
+
+The EC2 Security Group must allow inbound access to the control port and the full configured
+PASV port range — there is no Docker port mapping to fall back on with host networking.
+
+## Operational notes
+
+**Resource limits.** One active upload holds roughly four sockets/file descriptors at once:
+client control, backend control, client data, backend data. Size the host/container's `nofile`
+ulimit for `max_concurrent_sessions × ~4`, not daily upload count — the gateway is designed
+around many long-lived concurrent sessions from mobile IoT devices, not a high daily volume of
+short ones. The gateway itself doesn't impose an artificial concurrency cap; a transient
+`accept()` failure (e.g. hitting the fd limit) is logged and the gateway keeps serving existing
+sessions rather than crashing.
+
+**DNS round-robin deployment.** Each gateway instance is fully independent — no state is shared
+between instances (the PASV port pool and backend round-robin counter are both in-process only).
+DNS round-robin distributes *new* sessions across instances; a long-running session stays pinned
+to whichever instance accepted it. If an instance is lost, its in-flight sessions fail and the
+IoT device is expected to reconnect and retry — the gateway does not attempt to resume or
+migrate sessions itself.
+
 ## Logging
 
 Structured logs via `tracing`; set `RUST_LOG=info` (or `debug`) to see them. Every log line for
 a session carries its client address and selected backend. FTP passwords are never logged
-(`PASS` arguments are always redacted).
+(`PASS` arguments are always redacted). Uploads log their transfer duration (`duration_ms`) and
+byte count alongside the filename.
+
+Connection loss is expected on mobile IoT networks, not exceptional: a client disconnecting
+(cleanly or via a reset/broken pipe) is logged at INFO ("client disconnected"), while a backend
+failure or timeout is logged at WARN ("backend connection failed") — normal client churn should
+never show up as a warning.

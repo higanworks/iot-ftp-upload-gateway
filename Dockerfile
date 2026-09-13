@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM rust:1.98.1-alpine AS builder
-RUN apk add --no-cache musl-dev
+FROM rust:1.98.1-bookworm AS builder
 
 WORKDIR /app
 
@@ -17,7 +16,7 @@ COPY src ./src
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 COPY --from=builder /app/target/release/iot-ftp-upload-gateway /usr/local/bin/iot-ftp-upload-gateway
 
