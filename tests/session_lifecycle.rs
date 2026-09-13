@@ -7,7 +7,9 @@ mod common;
 
 use std::net::Ipv4Addr;
 
-use iot_ftp_upload_gateway::config::{BackendConfig, PassiveConfig, PortRange, TimeoutConfig};
+use iot_ftp_upload_gateway::config::{
+    BackendConfig, LimitsConfig, PassiveConfig, PortRange, TimeoutConfig,
+};
 use iot_ftp_upload_gateway::pasv::port_manager::PortManager;
 use iot_ftp_upload_gateway::server::session;
 use tokio::io::BufReader;
@@ -43,6 +45,7 @@ async fn spawn_session(
             backend_config,
             passive_config,
             timeouts,
+            LimitsConfig::default(),
             port_manager,
         )
         .await

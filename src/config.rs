@@ -14,6 +14,7 @@ pub struct Config {
     pub passive: PassiveConfig,
     pub backends: Vec<BackendConfig>,
     pub timeouts: TimeoutConfig,
+    pub limits: LimitsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -98,6 +99,24 @@ impl Default for TimeoutConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct LimitsConfig {
+    /// Upper bound on a single control-line read (client commands and backend replies alike).
+    /// Without this, a peer that never sends `\n` could make the gateway buffer an unbounded
+    /// amount of memory for one line (PROJECT_SECURITY.md section 4/6); exceeding it ends the
+    /// session rather than growing the line buffer further.
+    pub max_command_line_bytes: usize,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        LimitsConfig {
+            max_command_line_bytes: 4096,
+        }
+    }
+}
+
 impl Config {
     /// Loads the YAML file at `config_path` if given, then layers environment variables on top.
     pub fn load(config_path: Option<&Path>) -> Result<Config> {
@@ -156,6 +175,11 @@ impl Config {
             self.timeouts.data_idle_timeout_secs = v
                 .parse()
                 .context("invalid GATEWAY_DATA_IDLE_TIMEOUT_SECS")?;
+        }
+        if let Some(v) = env_var("GATEWAY_MAX_COMMAND_LINE_BYTES")? {
+            self.limits.max_command_line_bytes = v
+                .parse()
+                .context("invalid GATEWAY_MAX_COMMAND_LINE_BYTES")?;
         }
         Ok(())
     }

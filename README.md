@@ -84,6 +84,12 @@ config file and overridden per-environment via env vars.
 | Control connection idle timeout (secs) | `timeouts.idle_timeout_secs` | `GATEWAY_IDLE_TIMEOUT_SECS` |
 | Backend command response timeout (secs) | `timeouts.command_timeout_secs` | `GATEWAY_COMMAND_TIMEOUT_SECS` |
 | Data connection idle timeout (secs) | `timeouts.data_idle_timeout_secs` | `GATEWAY_DATA_IDLE_TIMEOUT_SECS` |
+| Max control-line length (bytes) | `limits.max_command_line_bytes` | `GATEWAY_MAX_COMMAND_LINE_BYTES` |
+
+A control line (a client command or a backend reply) that exceeds `max_command_line_bytes`
+without a terminating newline ends the session — a client hits `500 Command line too long`; a
+backend hitting it is treated as a backend failure. Without this cap, a peer that never sends a
+newline could make the gateway buffer an unbounded amount of memory for a single line.
 
 Backends are selected round-robin per session; a session's control connection and any PASV
 data connections always stay on the same backend for the lifetime of that session.
@@ -191,7 +197,10 @@ a session carries a `session_id` (unique per accepted connection, independent of
 ephemeral source port — the key to group one client's log lines together, including across a
 reconnect), the `client_ip` it came from, and the selected backend. FTP passwords are never
 logged (`PASS` arguments are always redacted). Uploads log their transfer duration (`duration_ms`)
-and byte count alongside the filename.
+and byte count alongside the filename. Client-supplied strings (the filename, and command
+arguments in the raw-command debug log) have any control characters escaped before being written
+to the human-readable text log format, so a client can't forge extra log lines or terminal
+control sequences by embedding them in a filename.
 
 Raw per-command traffic (`received command`) is logged at DEBUG rather than INFO — it's
 high-volume and low-signal for normal operation, and log processors like CloudWatch Logs

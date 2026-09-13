@@ -60,6 +60,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 let backend = backend_selector.next();
                 let passive = config.passive;
                 let timeouts = config.timeouts;
+                let limits = config.limits;
                 let port_manager = port_manager.clone();
 
                 sessions.spawn(async move {
@@ -70,6 +71,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         backend,
                         passive,
                         timeouts,
+                        limits,
                         port_manager,
                     )
                     .await

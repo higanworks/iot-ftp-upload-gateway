@@ -2,14 +2,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::backend;
-use crate::config::{BackendConfig, PassiveConfig, TimeoutConfig};
+use crate::config::{BackendConfig, LimitsConfig, PassiveConfig, TimeoutConfig};
 use crate::pasv::port_manager::{PasvPortGuard, PortManager};
 use crate::pasv::relay;
-use crate::protocol::command::FtpCommand;
+use crate::protocol::command::{FtpCommand, escape_control_chars};
 use crate::protocol::reply;
 
 /// A data connection ready to relay: the client's side has connected to the Gateway's PASV
@@ -49,12 +49,32 @@ macro_rules! backend_io {
     };
 }
 
+/// Reads one line, capping the number of bytes consumed to `max_bytes` (PROJECT_SECURITY.md
+/// section 4/6): without this, a peer that never sends `\n` could make the gateway buffer an
+/// unbounded amount of memory for a single line. If the cap is hit before a `\n` is found, this
+/// returns an `InvalidData` error rather than continuing to read.
+async fn read_line_bounded(
+    conn: &mut BufReader<TcpStream>,
+    line: &mut String,
+    max_bytes: usize,
+) -> io::Result<usize> {
+    let bytes_read = conn.take(max_bytes as u64).read_line(line).await?;
+    if bytes_read == max_bytes && !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "line exceeds maximum allowed length",
+        ));
+    }
+    Ok(bytes_read)
+}
+
 async fn read_line_with_timeout(
     conn: &mut BufReader<TcpStream>,
     line: &mut String,
     timeout: Duration,
+    max_bytes: usize,
 ) -> io::Result<usize> {
-    match tokio::time::timeout(timeout, conn.read_line(line)).await {
+    match tokio::time::timeout(timeout, read_line_bounded(conn, line, max_bytes)).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -71,9 +91,14 @@ async fn read_line_with_timeout(
 /// the client reconnects from the same IP with a different ephemeral source port; `client_ip`
 /// (the IP alone, without the ephemeral port) is what's meant for filtering/aggregating across
 /// sessions from the same device.
+// Each parameter is its own independently-meaningful piece of session setup (matching this
+// codebase's existing split of config into BackendConfig/PassiveConfig/TimeoutConfig/
+// LimitsConfig), so bundling them into one wrapper struct just to satisfy this lint's default
+// threshold wouldn't clarify anything.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "session",
-    skip(client, peer_addr, backend_config, passive_config, timeouts, port_manager),
+    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager),
     fields(
         session_id = session_id,
         client_ip = %peer_addr.ip(),
@@ -88,6 +113,7 @@ pub async fn handle(
     backend_config: BackendConfig,
     passive_config: PassiveConfig,
     timeouts: TimeoutConfig,
+    limits: LimitsConfig,
     port_manager: PortManager,
 ) -> anyhow::Result<()> {
     tracing::info!("session started");
@@ -96,6 +122,7 @@ pub async fn handle(
     let idle_timeout = Duration::from_secs(timeouts.idle_timeout_secs);
     let command_timeout = Duration::from_secs(timeouts.command_timeout_secs);
     let data_idle_timeout = Duration::from_secs(timeouts.data_idle_timeout_secs);
+    let max_command_line_bytes = limits.max_command_line_bytes;
 
     let backend_stream =
         match backend::connection::connect(&backend_config, connection_timeout).await {
@@ -114,8 +141,15 @@ pub async fn handle(
 
     // Relay the backend's initial banner to the client as-is.
     let mut line = String::new();
-    let banner_bytes =
-        backend_io!(read_line_with_timeout(&mut backend_conn, &mut line, command_timeout).await);
+    let banner_bytes = backend_io!(
+        read_line_with_timeout(
+            &mut backend_conn,
+            &mut line,
+            command_timeout,
+            max_command_line_bytes
+        )
+        .await
+    );
     if banner_bytes == 0 {
         tracing::warn!("backend closed connection unexpectedly");
         let _ = client_conn
@@ -130,8 +164,19 @@ pub async fn handle(
         tokio::select! {
             biased;
 
-            control_result = client_conn.read_line(&mut line) => {
-                let bytes_read = client_io!(control_result);
+            control_result = read_line_bounded(&mut client_conn, &mut line, max_command_line_bytes) => {
+                let bytes_read = match control_result {
+                    Ok(n) => n,
+                    Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                        tracing::warn!(error = %err, "client command line exceeds maximum length");
+                        let _ = client_conn.write_all(b"500 Command line too long\r\n").await;
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::info!(error = %err, "client disconnected");
+                        return Ok(());
+                    }
+                };
                 if bytes_read == 0 {
                     tracing::info!("client disconnected");
                     break;
@@ -181,6 +226,12 @@ pub async fn handle(
                     && let Some(guard) = active_pasv.take()
                 {
                     let filename = filename.clone();
+                    // Logged separately from `filename` itself: a client-supplied filename could
+                    // contain control/ANSI-escape characters (though not a literal `\n` -- the
+                    // control-line reader already stops there), which would otherwise be written
+                    // verbatim into human-readable text logs (PROJECT_SECURITY.md section 11).
+                    // The real `filename` is still forwarded to the backend untouched below.
+                    let filename_log = escape_control_chars(&filename);
                     let port = guard.port();
 
                     // The client is expected to have already connected to the PASV port (or to
@@ -212,13 +263,19 @@ pub async fn handle(
 
                     if let Some(mut channel) = channel {
                         let upload_start = Instant::now();
-                        tracing::info!(%filename, "upload started");
+                        tracing::info!(%filename_log, "upload started");
 
                         backend_io!(backend_conn.write_all(line.as_bytes()).await);
 
                         let mut backend_reply = String::new();
                         let reply_bytes = backend_io!(
-                            read_line_with_timeout(&mut backend_conn, &mut backend_reply, command_timeout).await
+                            read_line_with_timeout(
+                                &mut backend_conn,
+                                &mut backend_reply,
+                                command_timeout,
+                                max_command_line_bytes
+                            )
+                            .await
                         );
                         if reply_bytes == 0 {
                             tracing::warn!("backend closed connection unexpectedly");
@@ -238,18 +295,24 @@ pub async fn handle(
                         .await;
                         match relay_result {
                             Ok((bytes_uploaded, _)) => {
-                                tracing::info!(%filename, bytes_uploaded, "upload data transferred");
+                                tracing::info!(%filename_log, bytes_uploaded, "upload data transferred");
                             }
                             Err(err) => {
                                 let duration_ms = upload_start.elapsed().as_millis() as u64;
-                                tracing::warn!(%filename, error = %err, duration_ms, "upload failed: data relay error");
+                                tracing::warn!(%filename_log, error = %err, duration_ms, "upload failed: data relay error");
                             }
                         }
-                        tracing::info!(%filename, "data connection closed");
+                        tracing::info!(%filename_log, "data connection closed");
 
                         let mut completion = String::new();
                         let completion_bytes = backend_io!(
-                            read_line_with_timeout(&mut backend_conn, &mut completion, command_timeout).await
+                            read_line_with_timeout(
+                                &mut backend_conn,
+                                &mut completion,
+                                command_timeout,
+                                max_command_line_bytes
+                            )
+                            .await
                         );
                         if completion_bytes == 0 {
                             tracing::warn!("backend closed connection unexpectedly");
@@ -261,9 +324,9 @@ pub async fn handle(
                         let completion_trimmed = completion.trim_end_matches(['\r', '\n']);
                         let duration_ms = upload_start.elapsed().as_millis() as u64;
                         if completion_trimmed.starts_with('2') {
-                            tracing::info!(%filename, reply = %completion_trimmed, duration_ms, "upload finished");
+                            tracing::info!(%filename_log, reply = %completion_trimmed, duration_ms, "upload finished");
                         } else {
-                            tracing::warn!(%filename, reply = %completion_trimmed, duration_ms, "upload failed");
+                            tracing::warn!(%filename_log, reply = %completion_trimmed, duration_ms, "upload failed");
                         }
                         client_io!(client_conn.write_all(completion.as_bytes()).await);
                         continue;
@@ -285,7 +348,13 @@ pub async fn handle(
 
                 let mut backend_reply = String::new();
                 let reply_bytes = backend_io!(
-                    read_line_with_timeout(&mut backend_conn, &mut backend_reply, command_timeout).await
+                    read_line_with_timeout(
+                        &mut backend_conn,
+                        &mut backend_reply,
+                        command_timeout,
+                        max_command_line_bytes
+                    )
+                    .await
                 );
                 if reply_bytes == 0 {
                     tracing::warn!("backend closed connection unexpectedly");

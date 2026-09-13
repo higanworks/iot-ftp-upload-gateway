@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use iot_ftp_upload_gateway::config::{BackendConfig, PassiveConfig, TimeoutConfig};
+use iot_ftp_upload_gateway::config::{BackendConfig, LimitsConfig, PassiveConfig, TimeoutConfig};
 use iot_ftp_upload_gateway::pasv::port_manager::PortManager;
 use iot_ftp_upload_gateway::protocol::reply::{parse_pasv_reply, pasv_reply};
 use iot_ftp_upload_gateway::server::session;
@@ -168,6 +168,26 @@ pub async fn spawn_session(
     timeouts: TimeoutConfig,
     port_manager: PortManager,
 ) -> (SocketAddr, JoinHandle<anyhow::Result<()>>) {
+    spawn_session_with_limits(
+        backend_config,
+        passive_config,
+        timeouts,
+        LimitsConfig::default(),
+        port_manager,
+    )
+    .await
+}
+
+/// Like `spawn_session`, but lets a test override `LimitsConfig` (e.g. a small
+/// `max_command_line_bytes` to exercise the oversized-command-line rejection without having to
+/// send megabytes of data).
+pub async fn spawn_session_with_limits(
+    backend_config: BackendConfig,
+    passive_config: PassiveConfig,
+    timeouts: TimeoutConfig,
+    limits: LimitsConfig,
+    port_manager: PortManager,
+) -> (SocketAddr, JoinHandle<anyhow::Result<()>>) {
     let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_addr = gateway_listener.local_addr().unwrap();
 
@@ -180,6 +200,7 @@ pub async fn spawn_session(
             backend_config,
             passive_config,
             timeouts,
+            limits,
             port_manager,
         )
         .await
