@@ -176,6 +176,7 @@ pub async fn spawn_session(
         session::handle(
             stream,
             peer_addr,
+            1,
             backend_config,
             passive_config,
             timeouts,

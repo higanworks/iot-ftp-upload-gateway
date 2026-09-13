@@ -187,9 +187,17 @@ migrate sessions itself.
 ## Logging
 
 Structured logs via `tracing`; set `RUST_LOG=info` (or `debug`) to see them. Every log line for
-a session carries its client address and selected backend. FTP passwords are never logged
-(`PASS` arguments are always redacted). Uploads log their transfer duration (`duration_ms`) and
-byte count alongside the filename.
+a session carries a `session_id` (unique per accepted connection, independent of the client's
+ephemeral source port — the key to group one client's log lines together, including across a
+reconnect), the `client_ip` it came from, and the selected backend. FTP passwords are never
+logged (`PASS` arguments are always redacted). Uploads log their transfer duration (`duration_ms`)
+and byte count alongside the filename.
+
+Raw per-command traffic (`received command`) is logged at DEBUG rather than INFO — it's
+high-volume and low-signal for normal operation, and log processors like CloudWatch Logs
+Insights bill per byte ingested. The commands that matter operationally (PASV/STOR outcomes,
+QUIT ending the session) are already logged at INFO in their own right. Set `RUST_LOG=debug` to
+see raw commands too.
 
 By default logs are human-readable text. Set `GATEWAY_LOG_FORMAT=json` for structured JSON
 output (one object per line) instead — suited to log processors that parse JSON fields directly,
