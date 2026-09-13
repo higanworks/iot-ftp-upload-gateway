@@ -207,6 +207,9 @@ pub async fn handle(
                         );
                         if reply_bytes == 0 {
                             tracing::warn!("backend closed connection unexpectedly");
+                            let _ = client_conn
+                                .write_all(b"421 Service not available\r\n")
+                                .await;
                             break;
                         }
                         client_io!(client_conn.write_all(backend_reply.as_bytes()).await);
@@ -223,7 +226,7 @@ pub async fn handle(
                                 tracing::info!(%filename, bytes_uploaded, "upload data transferred");
                             }
                             Err(err) => {
-                                let duration_ms = upload_start.elapsed().as_millis();
+                                let duration_ms = upload_start.elapsed().as_millis() as u64;
                                 tracing::warn!(%filename, error = %err, duration_ms, "upload failed: data relay error");
                             }
                         }
@@ -235,10 +238,13 @@ pub async fn handle(
                         );
                         if completion_bytes == 0 {
                             tracing::warn!("backend closed connection unexpectedly");
+                            let _ = client_conn
+                                .write_all(b"426 Connection closed; transfer aborted\r\n")
+                                .await;
                             break;
                         }
                         let completion_trimmed = completion.trim_end_matches(['\r', '\n']);
-                        let duration_ms = upload_start.elapsed().as_millis();
+                        let duration_ms = upload_start.elapsed().as_millis() as u64;
                         if completion_trimmed.starts_with('2') {
                             tracing::info!(%filename, reply = %completion_trimmed, duration_ms, "upload finished");
                         } else {
@@ -268,9 +274,20 @@ pub async fn handle(
                 );
                 if reply_bytes == 0 {
                     tracing::warn!("backend closed connection unexpectedly");
+                    let _ = client_conn
+                        .write_all(b"421 Service not available\r\n")
+                        .await;
                     break;
                 }
                 client_io!(client_conn.write_all(backend_reply.as_bytes()).await);
+
+                if let FtpCommand::Quit = command {
+                    // Standard FTP behavior: once the backend's goodbye has been relayed, end
+                    // the session ourselves rather than waiting for the client to close its end
+                    // (which it may delay, tying up a backend connection and a PASV port slot
+                    // in the meantime).
+                    break;
+                }
             }
 
             _ = tokio::time::sleep(idle_timeout) => {

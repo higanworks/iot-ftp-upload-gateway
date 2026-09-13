@@ -86,9 +86,9 @@ docker run -e GATEWAY_BACKENDS="ftp01:21,ftp02:21" \
            iot-ftp-upload-gateway
 ```
 
-`docker-compose.yml` spins up the gateway alongside two `delfer/alpine-ftp-server` backends on
-a dedicated bridge network with static IPs, for local end-to-end testing without relying on the
-host's loopback (which real containerized backends won't share with the gateway):
+`docker-compose.yml` spins up the gateway alongside three `delfer/alpine-ftp-server` backends
+on a dedicated bridge network with static IPs, for local end-to-end testing without relying on
+the host's loopback (which real containerized backends won't share with the gateway):
 
 ```sh
 docker compose up -d --build
@@ -145,6 +145,12 @@ Structured logs via `tracing`; set `RUST_LOG=info` (or `debug`) to see them. Eve
 a session carries its client address and selected backend. FTP passwords are never logged
 (`PASS` arguments are always redacted). Uploads log their transfer duration (`duration_ms`) and
 byte count alongside the filename.
+
+By default logs are human-readable text. Set `GATEWAY_LOG_FORMAT=json` for structured JSON
+output (one object per line) instead — suited to log processors that parse JSON fields directly,
+such as AWS CloudWatch Logs Insights. This is read directly from the environment before startup,
+independently of the layered YAML/env `Config` system used for everything else, since logging
+has to be initialized before there's anything to log with.
 
 Connection loss is expected on mobile IoT networks, not exceptional: a client disconnecting
 (cleanly or via a reset/broken pipe) is logged at INFO ("client disconnected"), while a backend

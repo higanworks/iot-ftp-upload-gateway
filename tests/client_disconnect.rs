@@ -6,52 +6,13 @@
 mod common;
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
+use common::{await_session, spawn_session};
 use iot_ftp_upload_gateway::config::{BackendConfig, PassiveConfig, PortRange, TimeoutConfig};
 use iot_ftp_upload_gateway::pasv::port_manager::PortManager;
 use iot_ftp_upload_gateway::protocol::reply::parse_pasv_reply;
-use iot_ftp_upload_gateway::server::session;
 use tokio::io::{AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
-
-/// Spawns a session against the given backend/passive config, accepting a single client
-/// connection on an ephemeral port. Returns the address to connect to as the client and a
-/// handle to the session task, so the test can wait for it and assert it didn't panic.
-async fn spawn_session(
-    backend_config: BackendConfig,
-    passive_config: PassiveConfig,
-    timeouts: TimeoutConfig,
-    port_manager: PortManager,
-) -> (std::net::SocketAddr, JoinHandle<anyhow::Result<()>>) {
-    let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let gateway_addr = gateway_listener.local_addr().unwrap();
-
-    let handle = tokio::spawn(async move {
-        let (stream, peer_addr) = gateway_listener.accept().await.unwrap();
-        session::handle(
-            stream,
-            peer_addr,
-            backend_config,
-            passive_config,
-            timeouts,
-            port_manager,
-        )
-        .await
-    });
-
-    (gateway_addr, handle)
-}
-
-/// Waits for a session task to finish, failing the test (rather than hanging forever) if it
-/// doesn't within a few seconds.
-async fn await_session(task: JoinHandle<anyhow::Result<()>>) -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(5), task)
-        .await
-        .expect("session task hung instead of finishing")
-        .expect("session task panicked")
-}
+use tokio::net::TcpStream;
 
 #[tokio::test]
 async fn client_disconnect_after_pasv_releases_port() {
