@@ -71,6 +71,14 @@ load balancer or container-published address); binding to that same address inst
 the listener unreachable behind NAT/containers, which is exactly the deployment this gateway
 targets.
 
+## Releases
+
+Pushing a `vX.Y.Z` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which publishes a GitHub Release with prebuilt Linux binaries (`x86_64` and `aarch64`, built
+natively rather than cross-compiled) and pushes a multi-arch (`linux/amd64`, `linux/arm64`)
+Docker image to `ghcr.io/higanworks/iot-ftp-upload-gateway`, tagged with both the version and
+`latest`.
+
 ## Docker
 
 Multi-stage build producing a glibc-linked binary on a `distroless/cc` base — no shell, no

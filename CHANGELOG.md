@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-13
+
 ### Added
 
 - Minimal FTP gateway relaying `USER`/`PASS`/`SYST`/`TYPE`/`PWD`/`CWD`/`PASV`/`EPSV`/`STOR`/
@@ -22,18 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Graceful shutdown on SIGTERM/SIGINT: stop accepting new connections, drain in-flight sessions.
 - Structured logging via `tracing`, with client disconnects logged at INFO and backend
   failures/timeouts at WARN, upload duration and byte count on every transfer, and FTP passwords
-  always redacted.
+  always redacted. Optional JSON output (`GATEWAY_LOG_FORMAT=json`) for log processors such as
+  AWS CloudWatch Logs Insights.
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-### Fixed
-
-- A `PASV`/`EPSV` data connection could be starved by the client sending further commands
-  immediately afterward, since control-line reads were always prioritized over accepting the
-  pending data connection; the data connection is now accepted synchronously once `STOR`
-  arrives instead of racing it against control reads.
-- The address advertised to clients in PASV replies and the address the data listener bound to
-  were the same config value; behind NAT/containers this made the listener unreachable. The
-  listener now always binds `0.0.0.0`, independent of the advertised address.
-
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/commits/main
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/higanworks/iot-ftp-upload-gateway/releases/tag/v0.1.0
