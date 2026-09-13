@@ -10,6 +10,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.9.0] - 2026-09-13
+
 ### Added
 
 - Per-session `session_id` and `client_ip` log fields, so every log line for one client
@@ -17,11 +19,15 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - `limits.max_command_line_bytes` / `GATEWAY_MAX_COMMAND_LINE_BYTES` config option: caps how much
   a single control line (client command or backend reply) can grow before a terminating newline,
   closing an unbounded-memory-growth vector for a peer that never sends one.
+- CI now runs a real Docker Compose integration test (gateway + 3 real FTP backends) alongside
+  the existing `cargo test` suite.
 
 ### Changed
 
 - Raw per-command logging (`received command`) moved from INFO to DEBUG to reduce log volume
   (and log-processor ingestion cost) for normal operation.
+- Versioning policy switched from SemVer to CalVer (`vYYYY.M.PATCH`); this is the first CalVer
+  release.
 
 ### Security
 
@@ -51,5 +57,6 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.0...HEAD
+[2026.9.0]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v0.1.0...v2026.9.0
 [0.1.0]: https://github.com/higanworks/iot-ftp-upload-gateway/releases/tag/v0.1.0
