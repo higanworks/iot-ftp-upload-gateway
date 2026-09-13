@@ -1,3 +1,27 @@
+use std::borrow::Cow;
+
+/// Escapes ASCII control characters (everything `char::is_control` reports true for, including
+/// `\r` and ANSI escape bytes) using Rust's backslash escape notation, so a client-controlled
+/// string (a filename, or a raw command argument) can never forge extra lines or terminal
+/// control sequences when written verbatim into a human-readable log line
+/// (PROJECT_SECURITY.md section 11). A `\n` can't appear here in the first place -- the control
+/// line reader already stops at the first one -- but `\r` and other control bytes can. JSON-format
+/// logs are unaffected either way, since JSON string escaping already handles this.
+pub fn escape_control_chars(input: &str) -> Cow<'_, str> {
+    if !input.chars().any(|c| c.is_control()) {
+        return Cow::Borrowed(input);
+    }
+    let mut escaped = String::with_capacity(input.len());
+    for c in input.chars() {
+        if c.is_control() {
+            escaped.extend(c.escape_default());
+        } else {
+            escaped.push(c);
+        }
+    }
+    Cow::Owned(escaped)
+}
+
 /// The minimal set of FTP commands an IoT device needs for uploading, as listed in PROJECT.ja.md section 4.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FtpCommand {
@@ -44,18 +68,18 @@ impl FtpCommand {
     /// String representation for logging. Never includes the PASS argument (the password itself).
     pub fn as_log_str(&self) -> String {
         match self {
-            FtpCommand::User(arg) => format!("USER {arg}"),
+            FtpCommand::User(arg) => format!("USER {}", escape_control_chars(arg)),
             FtpCommand::Pass(_) => "PASS <redacted>".to_string(),
             FtpCommand::Syst => "SYST".to_string(),
-            FtpCommand::Type(arg) => format!("TYPE {arg}"),
+            FtpCommand::Type(arg) => format!("TYPE {}", escape_control_chars(arg)),
             FtpCommand::Pwd => "PWD".to_string(),
-            FtpCommand::Cwd(arg) => format!("CWD {arg}"),
+            FtpCommand::Cwd(arg) => format!("CWD {}", escape_control_chars(arg)),
             FtpCommand::Pasv => "PASV".to_string(),
             FtpCommand::Epsv => "EPSV".to_string(),
-            FtpCommand::Stor(arg) => format!("STOR {arg}"),
+            FtpCommand::Stor(arg) => format!("STOR {}", escape_control_chars(arg)),
             FtpCommand::Quit => "QUIT".to_string(),
             FtpCommand::Noop => "NOOP".to_string(),
-            FtpCommand::Unknown(verb) => format!("UNKNOWN {verb}"),
+            FtpCommand::Unknown(verb) => format!("UNKNOWN {}", escape_control_chars(verb)),
         }
     }
 }
@@ -114,5 +138,21 @@ mod tests {
     fn pass_log_str_never_contains_password() {
         let command = FtpCommand::parse("PASS super-secret");
         assert_eq!(command.as_log_str(), "PASS <redacted>");
+    }
+
+    #[test]
+    fn log_str_escapes_control_characters_in_arguments() {
+        let command = FtpCommand::parse("STOR evil\rfile.txt");
+        let log_str = command.as_log_str();
+        assert!(!log_str.contains('\r'));
+        assert_eq!(log_str, "STOR evil\\rfile.txt");
+    }
+
+    #[test]
+    fn escape_control_chars_leaves_plain_input_untouched() {
+        assert!(matches!(
+            escape_control_chars("plain.txt"),
+            Cow::Borrowed(_)
+        ));
     }
 }

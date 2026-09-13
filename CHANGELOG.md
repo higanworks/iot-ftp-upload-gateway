@@ -11,11 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Per-session `session_id` and `client_ip` log fields, so every log line for one client
   connection can be grouped and filtered independently of its ephemeral source port.
+- `limits.max_command_line_bytes` / `GATEWAY_MAX_COMMAND_LINE_BYTES` config option: caps how much
+  a single control line (client command or backend reply) can grow before a terminating newline,
+  closing an unbounded-memory-growth vector for a peer that never sends one.
 
 ### Changed
 
 - Raw per-command logging (`received command`) moved from INFO to DEBUG to reduce log volume
   (and log-processor ingestion cost) for normal operation.
+
+### Security
+
+- Control characters in client-supplied strings (filenames, command arguments) are now escaped
+  before being written to the human-readable text log format, preventing log/terminal injection
+  via a crafted filename.
 
 ## [0.1.0] - 2026-09-13
 

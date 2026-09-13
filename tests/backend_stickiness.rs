@@ -11,7 +11,7 @@ mod common;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use iot_ftp_upload_gateway::config::{
-    BackendConfig, Config, ListenConfig, PassiveConfig, PortRange, TimeoutConfig,
+    BackendConfig, Config, LimitsConfig, ListenConfig, PassiveConfig, PortRange, TimeoutConfig,
 };
 use tokio::io::BufReader;
 
@@ -43,6 +43,7 @@ async fn control_and_data_stay_on_the_backend_assigned_at_session_start() {
             })
             .collect(),
         timeouts: TimeoutConfig::default(),
+        limits: LimitsConfig::default(),
     };
     let gateway_addr = SocketAddr::new(config.listen.address, config.listen.port);
 
