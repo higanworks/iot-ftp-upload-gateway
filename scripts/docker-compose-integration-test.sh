@@ -7,6 +7,7 @@ set -euo pipefail
 
 GATEWAY_PORT=2131
 BACKEND_PORTS=(2221 2222 2223)
+COMPOSE_FILE="docker-compose.ci.yml"
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
@@ -25,10 +26,25 @@ wait_for_port() {
   return 1
 }
 
-# The gateway (a small Rust binary) starts listening almost immediately, well before the
-# alpine-ftp-server backends finish their own entrypoint setup (creating the FTP user etc.) --
-# waiting on the gateway's port alone isn't enough; each backend's control port must be up too.
-wait_for_port "$GATEWAY_PORT" "Gateway control port"
+# NOTE: do not readiness-check the gateway itself via a real TCP connection (e.g. /dev/tcp) --
+# the gateway assigns a backend from its round-robin counter as soon as it accepts a connection,
+# even if the "client" sends no commands and disconnects immediately. A bare connect-and-close
+# readiness probe against the gateway's own port would silently consume a round-robin slot and
+# shift every real test client's expected backend assignment by one. Instead, wait for the
+# gateway's own startup log line, which touches no sockets at all.
+wait_for_gateway_log() {
+  for _ in $(seq 1 60); do
+    if docker compose -f "$COMPOSE_FILE" logs gateway 2>/dev/null | grep -q "FTP listener started"; then
+      echo "Gateway is up."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: gateway did not log startup in time"
+  return 1
+}
+
+wait_for_gateway_log
 wait_for_port "${BACKEND_PORTS[0]}" "Backend 1 control port"
 wait_for_port "${BACKEND_PORTS[1]}" "Backend 2 control port"
 wait_for_port "${BACKEND_PORTS[2]}" "Backend 3 control port"
