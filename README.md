@@ -5,8 +5,6 @@ A minimal FTP gateway, written in Rust, that accepts plain FTP uploads from IoT 
 let FTP-only IoT devices upload through AWS Network Load Balancer / Kubernetes Service without
 publishing a huge PASV port range per backend, and without running a general-purpose FTP proxy.
 
-See [PROJECT.ja.md](PROJECT.ja.md) (Japanese) for the full design rationale and scope.
-
 ## Scope
 
 Only the commands an IoT device needs to upload a file are implemented: `USER`, `PASS`,
@@ -33,7 +31,12 @@ make check   # fmt-check + clippy + test
 
 ## Releases
 
-Pushing a `vX.Y.Z` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
+Versions follow CalVer: `vYYYY.M.PATCH` (year, non-zero-padded month, and a patch number that
+resets to `0` at the start of each new year/month) — e.g. `v2026.9.0`. `v0.1.0` was released
+under the project's original SemVer scheme, before this switch; every version from `v2026.9.0`
+onward is CalVer. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+
+Pushing a version tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which publishes a GitHub Release with prebuilt Linux binaries (`x86_64` and `aarch64`, built
 natively rather than cross-compiled) and pushes a multi-arch (`linux/amd64`, `linux/arm64`)
 Docker image to `ghcr.io/higanworks/iot-ftp-upload-gateway`, tagged with both the version and
