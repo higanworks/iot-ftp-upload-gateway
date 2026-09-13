@@ -9,6 +9,14 @@ pub fn pasv_reply(ip: Ipv4Addr, port: u16) -> String {
     format!("227 Entering Passive Mode ({o1},{o2},{o3},{o4},{p1},{p2}).\r\n")
 }
 
+/// Builds the 229 reply to an EPSV command (RFC 2428).
+/// Format: "229 Entering Extended Passive Mode (|||port|).\r\n"
+/// Unlike PASV, no address is included: the client is expected to reuse the address of the
+/// control connection for the data connection.
+pub fn epsv_reply(port: u16) -> String {
+    format!("229 Entering Extended Passive Mode (|||{port}|).\r\n")
+}
+
 /// Parses a 227 PASV reply (e.g. "227 Entering Passive Mode (127,0,0,1,39,16).")
 /// and extracts the address and port to connect to. Used when the Gateway itself
 /// acts as a PASV client toward a backend server.
@@ -53,6 +61,22 @@ mod tests {
         assert_eq!(
             reply,
             "227 Entering Passive Mode (255,255,255,255,255,255).\r\n"
+        );
+    }
+
+    #[test]
+    fn encodes_epsv_reply() {
+        assert_eq!(
+            epsv_reply(10000),
+            "229 Entering Extended Passive Mode (|||10000|).\r\n"
+        );
+        assert_eq!(
+            epsv_reply(0),
+            "229 Entering Extended Passive Mode (|||0|).\r\n"
+        );
+        assert_eq!(
+            epsv_reply(65535),
+            "229 Entering Extended Passive Mode (|||65535|).\r\n"
         );
     }
 

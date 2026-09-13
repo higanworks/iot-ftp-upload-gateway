@@ -35,7 +35,10 @@ impl Default for ListenConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct PassiveConfig {
-    /// IPv4 address advertised in PASV replies. IPv4-only, matching the project scope.
+    /// IPv4 address advertised to clients in PASV replies (IPv4-only, matching the project
+    /// scope). This is NOT the bind address for the data listener, which always binds
+    /// `0.0.0.0` regardless of this value -- set this to whatever address clients can
+    /// actually reach the gateway on (e.g. a NAT/load-balancer/container-published address).
     pub address: Ipv4Addr,
     pub port_range: PortRange,
 }

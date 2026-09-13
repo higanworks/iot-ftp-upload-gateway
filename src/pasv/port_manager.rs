@@ -8,6 +8,12 @@ use crate::config::PortRange;
 
 /// Manages the PASV data port pool. Picks a free port from the configured range
 /// and only hands out ports that could actually be bound.
+///
+/// Always binds on `0.0.0.0`, independent of the address advertised to clients in the PASV
+/// reply (`PassiveConfig::address`). Behind NAT or in a container (e.g. AWS ECS, Docker with
+/// published ports), the address reachable by clients is rarely the same address the process
+/// should bind on inside its own network namespace — binding to the advertised address would
+/// make the listener unreachable for exactly the deployments this gateway targets.
 #[derive(Clone)]
 pub struct PortManager {
     in_use: Arc<Mutex<HashSet<u16>>>,
@@ -23,7 +29,7 @@ impl PortManager {
     }
 
     /// Finds a free port and binds it. Returns None if the range has no free port.
-    pub async fn allocate(&self, address: Ipv4Addr) -> Option<PasvPortGuard> {
+    pub async fn allocate(&self) -> Option<PasvPortGuard> {
         for port in self.range.start..=self.range.end {
             let reserved = {
                 let mut in_use = self.in_use.lock().unwrap();
@@ -33,7 +39,7 @@ impl PortManager {
                 continue;
             }
 
-            let addr = SocketAddr::new(IpAddr::V4(address), port);
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
             match TcpListener::bind(addr).await {
                 Ok(listener) => {
                     return Some(PasvPortGuard {
@@ -85,10 +91,7 @@ mod tests {
             start: 19100,
             end: 19110,
         });
-        let guard = manager
-            .allocate(Ipv4Addr::LOCALHOST)
-            .await
-            .expect("port available");
+        let guard = manager.allocate().await.expect("port available");
         assert!((19100..=19110).contains(&guard.port()));
     }
 
@@ -98,14 +101,8 @@ mod tests {
             start: 19200,
             end: 19210,
         });
-        let guard1 = manager
-            .allocate(Ipv4Addr::LOCALHOST)
-            .await
-            .expect("first port available");
-        let guard2 = manager
-            .allocate(Ipv4Addr::LOCALHOST)
-            .await
-            .expect("second port available");
+        let guard1 = manager.allocate().await.expect("first port available");
+        let guard2 = manager.allocate().await.expect("second port available");
         assert_ne!(guard1.port(), guard2.port());
     }
 
@@ -115,15 +112,12 @@ mod tests {
             start: 19300,
             end: 19300,
         });
-        let guard = manager
-            .allocate(Ipv4Addr::LOCALHOST)
-            .await
-            .expect("port available");
+        let guard = manager.allocate().await.expect("port available");
         let port = guard.port();
         drop(guard);
 
         let guard2 = manager
-            .allocate(Ipv4Addr::LOCALHOST)
+            .allocate()
             .await
             .expect("port available again after release");
         assert_eq!(guard2.port(), port);
@@ -135,11 +129,8 @@ mod tests {
             start: 19400,
             end: 19400,
         });
-        let _guard = manager
-            .allocate(Ipv4Addr::LOCALHOST)
-            .await
-            .expect("first allocation succeeds");
-        let second = manager.allocate(Ipv4Addr::LOCALHOST).await;
+        let _guard = manager.allocate().await.expect("first allocation succeeds");
+        let second = manager.allocate().await;
         assert!(second.is_none());
     }
 }

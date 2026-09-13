@@ -1,0 +1,53 @@
+services:
+  ftp-backend-1:
+    image: delfer/alpine-ftp-server
+    networks:
+      ftp_net:
+        ipv4_address: 172.28.0.11
+    environment:
+      USERS: "iot|pass123"
+      ADDRESS: "172.28.0.11"
+      MIN_PORT: "21100"
+      MAX_PORT: "21110"
+    ports:
+      - "2221:21"
+      - "21100-21110:21100-21110"
+
+  ftp-backend-2:
+    image: delfer/alpine-ftp-server
+    networks:
+      ftp_net:
+        ipv4_address: 172.28.0.12
+    environment:
+      USERS: "iot|pass123"
+      ADDRESS: "172.28.0.12"
+      MIN_PORT: "21200"
+      MAX_PORT: "21210"
+    ports:
+      - "2222:21"
+      - "21200-21210:21200-21210"
+
+  gateway:
+    build: .
+    networks:
+      ftp_net:
+        ipv4_address: 172.28.0.10
+    depends_on:
+      - ftp-backend-1
+      - ftp-backend-2
+    environment:
+      GATEWAY_LISTEN_PORT: "2131"
+      GATEWAY_BACKENDS: "172.28.0.11:21,172.28.0.12:21"
+      GATEWAY_PASSIVE_ADDRESS: "127.0.0.1"
+      GATEWAY_PASSIVE_PORT_RANGE_START: "18100"
+      GATEWAY_PASSIVE_PORT_RANGE_END: "18120"
+      RUST_LOG: "info"
+    ports:
+      - "2131:2131"
+      - "18100-18120:18100-18120"
+
+networks:
+  ftp_net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

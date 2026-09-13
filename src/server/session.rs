@@ -11,10 +11,9 @@ use crate::pasv::relay;
 use crate::protocol::command::FtpCommand;
 use crate::protocol::reply;
 
-/// A data connection that is ready to use: the client's side has connected to the Gateway's
-/// PASV port, and the Gateway has already opened the matching data connection to the backend
-/// (by acting as a PASV client toward it). It sits idle until a data-transfer command (STOR)
-/// arrives on the control connection.
+/// A data connection ready to relay: the client's side has connected to the Gateway's PASV
+/// port, and the Gateway has opened the matching data connection to the backend (by acting
+/// as a PASV client toward it).
 struct DataChannel {
     client_data: TcpStream,
     backend_data: TcpStream,
@@ -55,7 +54,6 @@ pub async fn handle(
     let mut client_conn = BufReader::new(client);
     let mut backend_conn = BufReader::new(backend_stream);
     let mut active_pasv: Option<PasvPortGuard> = None;
-    let mut data_channel: Option<DataChannel> = None;
 
     // Relay the backend's initial banner to the client as-is.
     let mut line = String::new();
@@ -78,20 +76,24 @@ pub async fn handle(
                 let command = FtpCommand::parse(line.trim_end_matches(['\r', '\n']));
                 tracing::info!(command = %command.as_log_str(), "received command");
 
-                if let FtpCommand::Pasv = command {
+                if matches!(command, FtpCommand::Pasv | FtpCommand::Epsv) {
                     if let Some(old) = active_pasv.take() {
                         tracing::info!(port = old.port(), "PASV port released (replaced by new PASV)");
                         // `old` is dropped here, releasing the port back to the pool.
                     }
-                    if data_channel.take().is_some() {
-                        tracing::info!("data connection closed (unused, replaced by new PASV)");
-                    }
 
-                    match port_manager.allocate(passive_config.address).await {
+                    match port_manager.allocate().await {
                         Some(guard) => {
                             let port = guard.port();
                             tracing::info!(port, "PASV port allocated");
-                            let response = reply::pasv_reply(passive_config.address, port);
+                            // EPSV's reply carries no address (RFC 2428): the client reuses the
+                            // control connection's address. PASV must spell one out, so it uses
+                            // the configured advertised address.
+                            let response = if let FtpCommand::Epsv = command {
+                                reply::epsv_reply(port)
+                            } else {
+                                reply::pasv_reply(passive_config.address, port)
+                            };
                             client_conn.write_all(response.as_bytes()).await?;
                             active_pasv = Some(guard);
                         }
@@ -106,48 +108,86 @@ pub async fn handle(
                 }
 
                 if let FtpCommand::Stor(filename) = &command
-                    && let Some(mut channel) = data_channel.take()
+                    && let Some(guard) = active_pasv.take()
                 {
                     let filename = filename.clone();
-                    tracing::info!(%filename, "upload started");
+                    let port = guard.port();
 
-                    backend_conn.write_all(line.as_bytes()).await?;
-
-                    let mut backend_reply = String::new();
-                    let reply_bytes = backend_conn.read_line(&mut backend_reply).await?;
-                    if reply_bytes == 0 {
-                        tracing::warn!("backend closed connection unexpectedly");
-                        break;
-                    }
-                    client_conn.write_all(backend_reply.as_bytes()).await?;
-
-                    // Move the file bytes only after the backend confirmed it is ready (150).
-                    match relay::relay_bidirectional(&mut channel.client_data, &mut channel.backend_data).await {
-                        Ok((bytes_uploaded, _)) => {
-                            tracing::info!(%filename, bytes_uploaded, "upload data transferred");
+                    // The client is expected to have already connected to the PASV port (or to
+                    // be connecting right now); accept it here rather than racing this against
+                    // control-line reads in the select loop above, which starves this accept
+                    // when the client sends further commands back-to-back before we get a turn.
+                    let channel = match tokio::time::timeout(connection_timeout, guard.listener().accept()).await {
+                        Ok(Ok((client_data, data_peer))) => {
+                            tracing::info!(%data_peer, port, "data connection accepted");
+                            match relay::open_backend_data_connection(&mut backend_conn).await {
+                                Ok(backend_data) => Some(DataChannel { client_data, backend_data }),
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "failed to open backend data connection");
+                                    None
+                                }
+                            }
                         }
-                        Err(err) => {
-                            tracing::warn!(%filename, error = %err, "upload failed: data relay error");
+                        Ok(Err(err)) => {
+                            tracing::warn!(error = %err, "failed to accept data connection");
+                            None
                         }
-                    }
-                    tracing::info!(%filename, "data connection closed");
+                        Err(_) => {
+                            tracing::warn!("timed out waiting for client to open the data connection");
+                            None
+                        }
+                    };
+                    // `guard` is dropped here either way, releasing the port back to the pool.
+                    tracing::info!(port, "PASV port released");
 
-                    let mut completion = String::new();
-                    let completion_bytes = backend_conn.read_line(&mut completion).await?;
-                    if completion_bytes == 0 {
-                        tracing::warn!("backend closed connection unexpectedly");
-                        break;
+                    if let Some(mut channel) = channel {
+                        tracing::info!(%filename, "upload started");
+
+                        backend_conn.write_all(line.as_bytes()).await?;
+
+                        let mut backend_reply = String::new();
+                        let reply_bytes = backend_conn.read_line(&mut backend_reply).await?;
+                        if reply_bytes == 0 {
+                            tracing::warn!("backend closed connection unexpectedly");
+                            break;
+                        }
+                        client_conn.write_all(backend_reply.as_bytes()).await?;
+
+                        // Move the file bytes only after the backend confirmed it is ready (150).
+                        match relay::relay_bidirectional(&mut channel.client_data, &mut channel.backend_data).await {
+                            Ok((bytes_uploaded, _)) => {
+                                tracing::info!(%filename, bytes_uploaded, "upload data transferred");
+                            }
+                            Err(err) => {
+                                tracing::warn!(%filename, error = %err, "upload failed: data relay error");
+                            }
+                        }
+                        tracing::info!(%filename, "data connection closed");
+
+                        let mut completion = String::new();
+                        let completion_bytes = backend_conn.read_line(&mut completion).await?;
+                        if completion_bytes == 0 {
+                            tracing::warn!("backend closed connection unexpectedly");
+                            break;
+                        }
+                        let completion_trimmed = completion.trim_end_matches(['\r', '\n']);
+                        if completion_trimmed.starts_with('2') {
+                            tracing::info!(%filename, reply = %completion_trimmed, "upload finished");
+                        } else {
+                            tracing::warn!(%filename, reply = %completion_trimmed, "upload failed");
+                        }
+                        client_conn.write_all(completion.as_bytes()).await?;
+                        continue;
                     }
-                    let completion_trimmed = completion.trim_end_matches(['\r', '\n']);
-                    if completion_trimmed.starts_with('2') {
-                        tracing::info!(%filename, reply = %completion_trimmed, "upload finished");
-                    } else {
-                        tracing::warn!(%filename, reply = %completion_trimmed, "upload failed");
-                    }
-                    client_conn.write_all(completion.as_bytes()).await?;
+
+                    // Could not establish the data connection; let the client know and move on
+                    // rather than forwarding STOR to a backend that never got its own PASV.
+                    client_conn
+                        .write_all(b"425 Can't open data connection\r\n")
+                        .await?;
                     continue;
                 }
-                // If this was a STOR without a ready data connection, fall through and let
+                // If this was a STOR without a PASV port allocated, fall through and let
                 // the backend respond with its own error (e.g. "425 Use PASV first").
 
                 backend_conn.write_all(line.as_bytes()).await?;
@@ -161,35 +201,6 @@ pub async fn handle(
                 client_conn.write_all(backend_reply.as_bytes()).await?;
             }
 
-            accept_result = accept_pasv_data(active_pasv.as_ref()), if active_pasv.is_some() => {
-                let port = active_pasv
-                    .as_ref()
-                    .expect("branch only runs while active_pasv is Some")
-                    .port();
-
-                match accept_result {
-                    Ok((client_data, data_peer)) => {
-                        tracing::info!(%data_peer, port, "data connection accepted");
-
-                        match relay::open_backend_data_connection(&mut backend_conn).await {
-                            Ok(backend_data) => {
-                                data_channel = Some(DataChannel { client_data, backend_data });
-                            }
-                            Err(err) => {
-                                tracing::warn!(error = %err, "failed to open backend data connection");
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to accept data connection");
-                    }
-                }
-
-                // The listener has served its single connection; release the port immediately.
-                active_pasv = None;
-                tracing::info!(port, "PASV port released");
-            }
-
             _ = tokio::time::sleep(idle_timeout) => {
                 tracing::warn!(idle_timeout_secs = timeouts.idle_timeout_secs, "idle timeout reached");
                 let _ = client_conn.write_all(b"421 Idle timeout, closing control connection\r\n").await;
@@ -201,20 +212,7 @@ pub async fn handle(
     if let Some(guard) = active_pasv.take() {
         tracing::info!(port = guard.port(), "PASV port released");
     }
-    if data_channel.take().is_some() {
-        tracing::info!("data connection closed (unused, session ending)");
-    }
 
     tracing::info!("session ended");
     Ok(())
-}
-
-async fn accept_pasv_data(
-    guard: Option<&PasvPortGuard>,
-) -> std::io::Result<(TcpStream, SocketAddr)> {
-    guard
-        .expect("select! only polls this branch when active_pasv is Some")
-        .listener()
-        .accept()
-        .await
 }
