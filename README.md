@@ -88,11 +88,18 @@ config file and overridden per-environment via env vars.
 | Backend command response timeout (secs) | `timeouts.command_timeout_secs` | `GATEWAY_COMMAND_TIMEOUT_SECS` |
 | Data connection idle timeout (secs) | `timeouts.data_idle_timeout_secs` | `GATEWAY_DATA_IDLE_TIMEOUT_SECS` |
 | Max control-line length (bytes) | `limits.max_command_line_bytes` | `GATEWAY_MAX_COMMAND_LINE_BYTES` |
+| Max concurrent connections per client IP | `limits.max_connections_per_ip` | `GATEWAY_MAX_CONNECTIONS_PER_IP` |
 
 A control line (a client command or a backend reply) that exceeds `max_command_line_bytes`
 without a terminating newline ends the session — a client hits `500 Command line too long`; a
 backend hitting it is treated as a backend failure. Without this cap, a peer that never sends a
 newline could make the gateway buffer an unbounded amount of memory for a single line.
+
+`max_connections_per_ip` (default `10`) rejects a new connection outright (no reply, connection
+closed) once a single client IP already holds that many open — without it, one misbehaving or
+malicious source could open unlimited connections and exhaust file descriptors/memory on its
+own. Set to `0` to disable the check entirely. Operators behind carrier-grade NAT, where many IoT
+devices can share one public IP, should raise this or disable it.
 
 Backends are selected round-robin per session; a session's control connection and any PASV
 data connections always stay on the same backend for the lifetime of that session.

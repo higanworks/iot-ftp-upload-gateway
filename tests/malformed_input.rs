@@ -120,6 +120,7 @@ async fn oversized_command_line_is_rejected() {
     // sending megabytes of data.
     let limits = LimitsConfig {
         max_command_line_bytes: 64,
+        ..LimitsConfig::default()
     };
 
     let (gateway_addr, session_task) = spawn_session_with_limits(

@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::pasv::port_manager::PortManager;
 use crate::shutdown;
 
+use super::ip_limiter::IpConnectionLimiter;
 use super::session;
 
 /// How long to wait for in-flight sessions to finish on their own after a shutdown
@@ -29,6 +30,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let port_manager = PortManager::new(config.passive.port_range);
     let backend_selector = BackendSelector::new(config.backends.clone());
+    let ip_limiter = IpConnectionLimiter::new(config.limits.max_connections_per_ip);
     let mut sessions = JoinSet::new();
 
     let shutdown_signal = shutdown::wait_for_shutdown_signal();
@@ -54,6 +56,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         continue;
                     }
                 };
+                let Some(ip_guard) = ip_limiter.try_acquire(peer_addr.ip()) else {
+                    tracing::warn!(%peer_addr, "connection limit reached for this IP");
+                    continue;
+                };
+
                 let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
                 tracing::info!(%peer_addr, session_id, "accepted new connection");
 
@@ -64,6 +71,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 let port_manager = port_manager.clone();
 
                 sessions.spawn(async move {
+                    // Held for the whole session so its slot in `ip_limiter` is released
+                    // exactly when the session ends (success, error, or panic).
+                    let _ip_guard = ip_guard;
                     if let Err(err) = session::handle(
                         stream,
                         peer_addr,

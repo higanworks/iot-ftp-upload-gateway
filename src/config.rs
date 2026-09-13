@@ -107,12 +107,20 @@ pub struct LimitsConfig {
     /// amount of memory for one line (PROJECT_SECURITY.md section 4/6); exceeding it ends the
     /// session rather than growing the line buffer further.
     pub max_command_line_bytes: usize,
+    /// Maximum number of concurrent connections accepted from a single client IP (default `10`).
+    /// `0` disables the check entirely -- unlimited connections per IP, the gateway's original
+    /// behavior. Without this, a single misbehaving or malicious source could open unlimited
+    /// connections and exhaust file descriptors/memory on its own (PROJECT_SECURITY.md section
+    /// 5, "Connection Exhaustion"). Operators behind carrier-grade NAT -- where many IoT devices
+    /// can share one public IP -- should raise this or disable it.
+    pub max_connections_per_ip: usize,
 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         LimitsConfig {
             max_command_line_bytes: 4096,
+            max_connections_per_ip: 10,
         }
     }
 }
@@ -180,6 +188,11 @@ impl Config {
             self.limits.max_command_line_bytes = v
                 .parse()
                 .context("invalid GATEWAY_MAX_COMMAND_LINE_BYTES")?;
+        }
+        if let Some(v) = env_var("GATEWAY_MAX_CONNECTIONS_PER_IP")? {
+            self.limits.max_connections_per_ip = v
+                .parse()
+                .context("invalid GATEWAY_MAX_CONNECTIONS_PER_IP")?;
         }
         Ok(())
     }
