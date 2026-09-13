@@ -150,3 +150,11 @@ Connection loss is expected on mobile IoT networks, not exceptional: a client di
 (cleanly or via a reset/broken pipe) is logged at INFO ("client disconnected"), while a backend
 failure or timeout is logged at WARN ("backend connection failed") — normal client churn should
 never show up as a warning.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
