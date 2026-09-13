@@ -48,9 +48,12 @@ services:
 
   gateway:
     build: .
-    networks:
-      ftp_net_ci:
-        ipv4_address: 172.29.0.10
+    # Host networking, not the bridge network the backends use: on real Linux (unlike Docker
+    # Desktop for Mac) this works cleanly for a single gateway container, removes a layer of
+    # NAT/port-mapping indirection for its own listeners, and matches the EC2 production
+    # deployment shape documented in the README. The host can still reach the backends directly
+    # by their bridge IPs below.
+    network_mode: host
     depends_on:
       - ftp-backend-1
       - ftp-backend-2
@@ -62,9 +65,6 @@ services:
       GATEWAY_PASSIVE_PORT_RANGE_START: "18100"
       GATEWAY_PASSIVE_PORT_RANGE_END: "18120"
       RUST_LOG: "info"
-    ports:
-      - "2131:2131"
-      - "18100-18120:18100-18120"
 
 networks:
   ftp_net_ci:

@@ -43,9 +43,13 @@ upload_and_verify() {
 
   echo "ci-integration-test-payload-${index}-$$" >"$local_file"
 
-  if ! curl -4 -fsS --disable-epsv -T "$local_file" \
+  local curl_trace="${WORKDIR}/${filename}.trace"
+  if ! curl -4 -sS --disable-epsv -T "$local_file" --trace-ascii "$curl_trace" \
     "ftp://iot:pass123@127.0.0.1:${GATEWAY_PORT}/${filename}"; then
     echo "FAIL: upload for client ${index} did not succeed"
+    echo "--- curl trace (${filename}) ---"
+    cat "$curl_trace"
+    echo "--- end curl trace ---"
     failed=1
     return
   fi
