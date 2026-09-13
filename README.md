@@ -123,13 +123,22 @@ docker build -t iot-ftp-upload-gateway .
 ```
 
 `docker-compose.yml` spins up the gateway alongside three `delfer/alpine-ftp-server` backends
-on a dedicated bridge network with static IPs, for local end-to-end testing without relying on
-the host's loopback (which real containerized backends won't share with the gateway):
+on a dedicated bridge network with static IPs — needed because each backend advertises its PASV
+address as a literal IP (the FTP protocol has no way to say "ask DNS"), so each container's IP
+has to be known ahead of time to configure it:
 
 ```sh
 docker compose up -d --build
 curl -T myfile.txt "ftp://iot:pass123@127.0.0.1:2131/myfile.txt"
 ```
+
+The same topology, on its own subnet, also runs in CI as
+[`docker-compose.ci.yml`](docker-compose.ci.yml) via
+[`.github/workflows/integration.yml`](.github/workflows/integration.yml): it brings the stack up,
+uploads through the gateway from 4 simulated clients, and reads each file back directly from the
+backend it should have landed on (round-robin, including the wraparound) to confirm both content
+integrity and correct backend selection — see
+[`scripts/docker-compose-integration-test.sh`](scripts/docker-compose-integration-test.sh).
 
 Graceful shutdown: the gateway stops accepting new connections on SIGTERM/SIGINT, waits (up to
 30s) for in-flight sessions to finish on their own, then exits — compatible with `docker stop`
@@ -137,9 +146,9 @@ and ECS task termination.
 
 ### Production deployment on EC2 (host networking)
 
-`docker-compose.yml`'s bridge network with static IPs is a Docker-Desktop-for-Mac workaround for
-local testing only, where the gateway and its backends can't share the host's loopback the way
-they can on real Linux. On EC2, use `network_mode: host` so the gateway listens directly on the
+The bridge-network-with-static-IPs setup above is for running multiple backends as sibling
+containers on one host (local dev, CI); a single production gateway has no such conflict. On
+EC2, use `network_mode: host` instead so the gateway listens directly on the
 host's network — no port mapping needed, and `GATEWAY_PASSIVE_ADDRESS` should be the EC2
 instance's own address:
 

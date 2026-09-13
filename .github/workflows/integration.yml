@@ -1,0 +1,26 @@
+name: Docker Integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  compose-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start the gateway + 3 backend stack
+        run: docker compose -f docker-compose.ci.yml up -d --build
+
+      - name: Run integration test
+        run: bash scripts/docker-compose-integration-test.sh
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.ci.yml logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.ci.yml down -v

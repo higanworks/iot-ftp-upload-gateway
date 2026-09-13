@@ -1,0 +1,73 @@
+# Dedicated compose file for the GitHub Actions Docker integration test
+# (.github/workflows/integration.yml). Same 3-backend + gateway topology as the top-level
+# docker-compose.yml (used for local development on Docker Desktop for Mac), kept as a separate
+# file/subnet so the two never collide if ever run side by side, and so CI's stack can evolve
+# independently of the local dev one.
+services:
+  ftp-backend-1:
+    image: delfer/alpine-ftp-server
+    networks:
+      ftp_net_ci:
+        ipv4_address: 172.29.0.11
+    environment:
+      USERS: "iot|pass123"
+      ADDRESS: "172.29.0.11"
+      MIN_PORT: "21100"
+      MAX_PORT: "21110"
+    ports:
+      - "2221:21"
+      - "21100-21110:21100-21110"
+
+  ftp-backend-2:
+    image: delfer/alpine-ftp-server
+    networks:
+      ftp_net_ci:
+        ipv4_address: 172.29.0.12
+    environment:
+      USERS: "iot|pass123"
+      ADDRESS: "172.29.0.12"
+      MIN_PORT: "21200"
+      MAX_PORT: "21210"
+    ports:
+      - "2222:21"
+      - "21200-21210:21200-21210"
+
+  ftp-backend-3:
+    image: delfer/alpine-ftp-server
+    networks:
+      ftp_net_ci:
+        ipv4_address: 172.29.0.13
+    environment:
+      USERS: "iot|pass123"
+      ADDRESS: "172.29.0.13"
+      MIN_PORT: "21300"
+      MAX_PORT: "21310"
+    ports:
+      - "2223:21"
+      - "21300-21310:21300-21310"
+
+  gateway:
+    build: .
+    networks:
+      ftp_net_ci:
+        ipv4_address: 172.29.0.10
+    depends_on:
+      - ftp-backend-1
+      - ftp-backend-2
+      - ftp-backend-3
+    environment:
+      GATEWAY_LISTEN_PORT: "2131"
+      GATEWAY_BACKENDS: "172.29.0.11:21,172.29.0.12:21,172.29.0.13:21"
+      GATEWAY_PASSIVE_ADDRESS: "127.0.0.1"
+      GATEWAY_PASSIVE_PORT_RANGE_START: "18100"
+      GATEWAY_PASSIVE_PORT_RANGE_END: "18120"
+      RUST_LOG: "info"
+    ports:
+      - "2131:2131"
+      - "18100-18120:18100-18120"
+
+networks:
+  ftp_net_ci:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
