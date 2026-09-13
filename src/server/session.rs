@@ -63,17 +63,28 @@ async fn read_line_with_timeout(
     }
 }
 
-/// `peer_addr` and the selected backend are recorded on the span so every log line emitted
-/// while handling this session (including from helper functions called within it) carries
-/// them automatically, without repeating `%peer_addr` on every call site.
+/// `session_id`, the client's IP, and the selected backend are recorded on the span so every
+/// log line emitted while handling this session (including from helper functions called within
+/// it) carries them automatically, without repeating them on every call site. `session_id`
+/// (rather than `peer_addr`, which is still logged separately at session start/end) is the
+/// intended key for grouping one client's log lines together, since it stays meaningful even if
+/// the client reconnects from the same IP with a different ephemeral source port; `client_ip`
+/// (the IP alone, without the ephemeral port) is what's meant for filtering/aggregating across
+/// sessions from the same device.
 #[tracing::instrument(
     name = "session",
-    skip(client, backend_config, passive_config, timeouts, port_manager),
-    fields(backend_host = %backend_config.host, backend_port = backend_config.port)
+    skip(client, peer_addr, backend_config, passive_config, timeouts, port_manager),
+    fields(
+        session_id = session_id,
+        client_ip = %peer_addr.ip(),
+        backend_host = %backend_config.host,
+        backend_port = backend_config.port
+    )
 )]
 pub async fn handle(
     client: TcpStream,
     peer_addr: SocketAddr,
+    session_id: u64,
     backend_config: BackendConfig,
     passive_config: PassiveConfig,
     timeouts: TimeoutConfig,
@@ -127,7 +138,11 @@ pub async fn handle(
                 }
 
                 let command = FtpCommand::parse(line.trim_end_matches(['\r', '\n']));
-                tracing::info!(command = %command.as_log_str(), "received command");
+                // Raw per-command traffic is high-volume and low-signal for normal operation
+                // (CloudWatch Logs Insights bills per byte ingested) -- kept at DEBUG rather
+                // than INFO; the commands that matter operationally (PASV/STOR outcomes,
+                // QUIT ending the session) are already logged at INFO in their own right below.
+                tracing::debug!(command = %command.as_log_str(), "received command");
 
                 if matches!(command, FtpCommand::Pasv | FtpCommand::Epsv) {
                     if let Some(old) = active_pasv.take() {

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -14,6 +15,12 @@ use super::session;
 /// How long to wait for in-flight sessions to finish on their own after a shutdown
 /// signal is received, before exiting regardless of what is still running.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Assigns each session a unique, human-readable id (independent of the client's ephemeral
+/// source port) so every log line for one client connection can be grouped together, including
+/// across a reconnect from the same IP. In-process only, like the rest of the gateway's state --
+/// not meant to be globally unique across gateway instances or restarts.
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let addr = SocketAddr::new(config.listen.address, config.listen.port);
@@ -47,7 +54,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         continue;
                     }
                 };
-                tracing::info!(%peer_addr, "accepted new connection");
+                let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(%peer_addr, session_id, "accepted new connection");
 
                 let backend = backend_selector.next();
                 let passive = config.passive;
@@ -55,10 +63,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 let port_manager = port_manager.clone();
 
                 sessions.spawn(async move {
-                    if let Err(err) =
-                        session::handle(stream, peer_addr, backend, passive, timeouts, port_manager).await
+                    if let Err(err) = session::handle(
+                        stream,
+                        peer_addr,
+                        session_id,
+                        backend,
+                        passive,
+                        timeouts,
+                        port_manager,
+                    )
+                    .await
                     {
-                        tracing::warn!(%peer_addr, error = %err, "session ended with error");
+                        tracing::warn!(%peer_addr, session_id, error = %err, "session ended with error");
                     }
                 });
             }
