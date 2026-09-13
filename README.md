@@ -55,7 +55,7 @@ tar xzf iot-ftp-upload-gateway.tar.gz
 
 ```sh
 docker pull ghcr.io/higanworks/iot-ftp-upload-gateway:latest
-# or pin a specific version for production, e.g. :0.1.0
+# or pin a specific version for production, e.g. :2026.9.0
 ```
 
 See [Docker](#docker) below for how to run it.

@@ -2,8 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+
+Versions follow CalVer: `vYYYY.M.PATCH` (year, non-zero-padded month, and a patch number that
+resets to `0` at the start of each new year/month). `v0.1.0` was released under the project's
+original SemVer scheme, before this switch; every version from `v2026.9.0` onward is CalVer.
 
 ## [Unreleased]
 
