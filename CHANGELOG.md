@@ -10,6 +10,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.9.1] - 2026-09-13
+
 ### Added
 
 - `limits.max_connections_per_ip` / `GATEWAY_MAX_CONNECTIONS_PER_IP` config option (default
@@ -64,6 +66,7 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.0...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.1...HEAD
+[2026.9.1]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.0...v2026.9.1
 [2026.9.0]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v0.1.0...v2026.9.0
 [0.1.0]: https://github.com/higanworks/iot-ftp-upload-gateway/releases/tag/v0.1.0
