@@ -10,15 +10,28 @@ BACKEND_PORTS=(2221 2222 2223)
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-echo "Waiting for the gateway control port to accept connections..."
-for _ in $(seq 1 30); do
-  if (exec 3<>"/dev/tcp/127.0.0.1/${GATEWAY_PORT}") 2>/dev/null; then
-    exec 3>&-
-    echo "Gateway is up."
-    break
-  fi
-  sleep 1
-done
+wait_for_port() {
+  local port="$1"
+  local label="$2"
+  for _ in $(seq 1 60); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
+      exec 3>&-
+      echo "${label} is up."
+      return 0
+    fi
+    sleep 1
+  done
+  echo "FAIL: ${label} did not become ready in time"
+  return 1
+}
+
+# The gateway (a small Rust binary) starts listening almost immediately, well before the
+# alpine-ftp-server backends finish their own entrypoint setup (creating the FTP user etc.) --
+# waiting on the gateway's port alone isn't enough; each backend's control port must be up too.
+wait_for_port "$GATEWAY_PORT" "Gateway control port"
+wait_for_port "${BACKEND_PORTS[0]}" "Backend 1 control port"
+wait_for_port "${BACKEND_PORTS[1]}" "Backend 2 control port"
+wait_for_port "${BACKEND_PORTS[2]}" "Backend 3 control port"
 
 failed=0
 
