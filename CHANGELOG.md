@@ -10,6 +10,13 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+### Added
+
+- `limits.max_connections_per_ip` / `GATEWAY_MAX_CONNECTIONS_PER_IP` config option (default
+  `10`): caps how many concurrent connections a single client IP may hold open, so one
+  misbehaving or malicious source can't exhaust file descriptors/memory on its own. `0` disables
+  the check.
+
 ## [2026.9.0] - 2026-09-13
 
 ### Added
