@@ -31,13 +31,43 @@ make test    # cargo test
 make check   # fmt-check + clippy + test
 ```
 
+## Releases
+
+Pushing a `vX.Y.Z` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which publishes a GitHub Release with prebuilt Linux binaries (`x86_64` and `aarch64`, built
+natively rather than cross-compiled) and pushes a multi-arch (`linux/amd64`, `linux/arm64`)
+Docker image to `ghcr.io/higanworks/iot-ftp-upload-gateway`, tagged with both the version and
+`latest`. Building from source (below) is only needed for development.
+
+**Prebuilt binary** — the `.../releases/latest/download/...` URL always resolves to the newest
+release, so this never needs updating for new versions:
+
+```sh
+curl -L -o iot-ftp-upload-gateway.tar.gz \
+  https://github.com/higanworks/iot-ftp-upload-gateway/releases/latest/download/iot-ftp-upload-gateway-x86_64-unknown-linux-gnu.tar.gz
+# aarch64 hosts (e.g. AWS Graviton): swap in iot-ftp-upload-gateway-aarch64-unknown-linux-gnu.tar.gz
+
+tar xzf iot-ftp-upload-gateway.tar.gz
+./iot-ftp-upload-gateway --config path/to/config.yaml
+```
+
+**Docker image**:
+
+```sh
+docker pull ghcr.io/higanworks/iot-ftp-upload-gateway:latest
+# or pin a specific version for production, e.g. :0.1.0
+```
+
+See [Docker](#docker) below for how to run it.
+
 ## Run
 
 ```sh
 cargo run -- --config path/to/config.yaml
 ```
 
-`--config` is optional. See [config.example.yaml](config.example.yaml) for the file format.
+`--config` is optional (works the same way with the prebuilt binary above, run directly instead
+of via `cargo run --`). See [config.example.yaml](config.example.yaml) for the file format.
 Configuration is layered as **defaults -> YAML file -> environment variables**, with
 environment variables taking the highest priority — the same setting can be defined in the
 config file and overridden per-environment via env vars.
@@ -71,27 +101,25 @@ load balancer or container-published address); binding to that same address inst
 the listener unreachable behind NAT/containers, which is exactly the deployment this gateway
 targets.
 
-## Releases
-
-Pushing a `vX.Y.Z` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which publishes a GitHub Release with prebuilt Linux binaries (`x86_64` and `aarch64`, built
-natively rather than cross-compiled) and pushes a multi-arch (`linux/amd64`, `linux/arm64`)
-Docker image to `ghcr.io/higanworks/iot-ftp-upload-gateway`, tagged with both the version and
-`latest`.
-
 ## Docker
 
-Multi-stage build producing a glibc-linked binary on a `distroless/cc` base — no shell, no
-package manager, runs as a non-root user.
-
 ```sh
-docker build -t iot-ftp-upload-gateway .
+docker pull ghcr.io/higanworks/iot-ftp-upload-gateway:latest
 docker run -e GATEWAY_BACKENDS="ftp01:21,ftp02:21" \
            -e GATEWAY_PASSIVE_ADDRESS=<address clients can reach> \
            -e GATEWAY_PASSIVE_PORT_RANGE_START=10000 \
            -e GATEWAY_PASSIVE_PORT_RANGE_END=10010 \
            -p 21:21 -p 10000-10010:10000-10010 \
-           iot-ftp-upload-gateway
+           ghcr.io/higanworks/iot-ftp-upload-gateway:latest
+```
+
+To build the image yourself instead of pulling the published one (e.g. for local changes): a
+multi-stage build producing a glibc-linked binary on a `distroless/cc` base — no shell, no
+package manager, runs as a non-root user.
+
+```sh
+docker build -t iot-ftp-upload-gateway .
+# then run it the same way as above, using this tag instead of the ghcr.io one
 ```
 
 `docker-compose.yml` spins up the gateway alongside three `delfer/alpine-ftp-server` backends
@@ -118,7 +146,7 @@ instance's own address:
 ```yaml
 services:
   gateway:
-    build: .
+    image: ghcr.io/higanworks/iot-ftp-upload-gateway:latest # pin a version tag in production
     network_mode: host
     environment:
       GATEWAY_BACKENDS: "ftp01:21,ftp02:21"
