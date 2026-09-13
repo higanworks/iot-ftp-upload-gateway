@@ -17,8 +17,8 @@ jobs:
       - name: Run integration test
         run: bash scripts/docker-compose-integration-test.sh
 
-      - name: Show container status and logs on failure
-        if: failure()
+      - name: Show container status and logs
+        if: always()
         run: |
           docker compose -f docker-compose.ci.yml ps -a
           docker compose -f docker-compose.ci.yml logs --timestamps
