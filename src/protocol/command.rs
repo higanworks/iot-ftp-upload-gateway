@@ -22,6 +22,16 @@ pub fn escape_control_chars(input: &str) -> Cow<'_, str> {
     Cow::Owned(escaped)
 }
 
+/// Returns true if `body` -- a command line already stripped of its trailing line terminator --
+/// still contains a CR or LF byte. `body` is what the control-line reader treated as a single
+/// FTP command; if a CR or LF survives inside it, the client smuggled a line break into what
+/// this Gateway forwards to the Backend as one command, and the Backend could split it into two
+/// (PROJECT_SECURITY.md section 4). Backslash (`\`) is not an FTP special character and is never
+/// flagged here.
+pub fn has_embedded_line_break(body: &str) -> bool {
+    body.contains('\r') || body.contains('\n')
+}
+
 /// The minimal set of FTP commands an IoT device needs for uploading, as listed in PROJECT.ja.md section 4.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FtpCommand {
@@ -154,5 +164,30 @@ mod tests {
             escape_control_chars("plain.txt"),
             Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn has_embedded_line_break_detects_cr() {
+        assert!(has_embedded_line_break("evil\rfile.txt"));
+    }
+
+    #[test]
+    fn has_embedded_line_break_detects_lf() {
+        assert!(has_embedded_line_break("evil\nfile.txt"));
+    }
+
+    #[test]
+    fn has_embedded_line_break_detects_crlf() {
+        assert!(has_embedded_line_break("evil\r\nfile.txt"));
+    }
+
+    #[test]
+    fn has_embedded_line_break_allows_plain_input() {
+        assert!(!has_embedded_line_break("plain.txt"));
+    }
+
+    #[test]
+    fn has_embedded_line_break_allows_backslash() {
+        assert!(!has_embedded_line_break(r"back\slash\file.txt"));
     }
 }
