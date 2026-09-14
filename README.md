@@ -5,6 +5,50 @@ A minimal FTP gateway, written in Rust, that accepts plain FTP uploads from IoT 
 let FTP-only IoT devices upload through AWS Network Load Balancer / Kubernetes Service without
 publishing a huge PASV port range per backend, and without running a general-purpose FTP proxy.
 
+It's also, deliberately, **write-only**: `RETR`, `LIST`, and every other command that could read
+data back out are rejected with `502` and never reach a Backend (see [Scope](#scope) below) — the
+gateway is structurally incapable of serving files, only accepting them. That makes it a useful
+boundary for legacy IoT fleets that still speak plain FTP and can't be upgraded to FTPS/TLS:
+instead of exposing the real FTP servers directly to the Internet (a full read/write/list/delete
+surface, in the clear, on hardware nobody wants to patch), put this gateway on the public/DMZ
+edge and move the actual FTP servers onto a private network the gateway alone can reach. Devices
+keep speaking the same plain FTP they always have; everything they can actually do is limited to
+"upload a file," and even a fully compromised gateway process can't be used to read anything back
+off the backends.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph internet["Internet"]
+        device1["Legacy IoT device"]
+        device2["Legacy IoT device"]
+        deviceN["..."]
+    end
+
+    subgraph dmz["Public / DMZ — only thing exposed"]
+        gw["iot-ftp-upload-gateway<br/>write-only, allow-listed FTP commands"]
+    end
+
+    subgraph private["Private network — not Internet-reachable"]
+        b1["Backend FTP #1"]
+        b2["Backend FTP #2"]
+        b3["Backend FTP #3"]
+    end
+
+    device1 -- "plain FTP<br/>control + PASV data" --> gw
+    device2 -- "plain FTP" --> gw
+    deviceN -- "plain FTP" --> gw
+    gw -- "STOR only, round-robin<br/>plain FTP" --> b1
+    gw -.-> b2
+    gw -.-> b3
+```
+
+A session's control connection and its PASV data connection always land on the same
+backend (picked round-robin when the session starts), so a client's upload is never split
+across backends. See [Operational notes](#operational-notes) for how this behaves across
+multiple gateway instances.
+
 ## Scope
 
 Only the commands an IoT device needs to upload a file are implemented: `USER`, `PASS`,
@@ -74,20 +118,22 @@ Configuration is layered as **defaults -> YAML file -> environment variables**, 
 environment variables taking the highest priority — the same setting can be defined in the
 config file and overridden per-environment via env vars.
 
-| Setting | Config path | Environment variable |
-|---|---|---|
-| Control listen address | `listen.address` | `GATEWAY_LISTEN_ADDRESS` |
-| Control listen port | `listen.port` | `GATEWAY_LISTEN_PORT` |
-| Address advertised in PASV replies | `passive.address` | `GATEWAY_PASSIVE_ADDRESS` |
-| PASV port range start | `passive.port_range.start` | `GATEWAY_PASSIVE_PORT_RANGE_START` |
-| PASV port range end | `passive.port_range.end` | `GATEWAY_PASSIVE_PORT_RANGE_END` |
-| Backend servers | `backends` | `GATEWAY_BACKENDS` (`host:port,host:port`) |
-| Backend connect timeout (secs) | `timeouts.connection_timeout_secs` | `GATEWAY_CONNECTION_TIMEOUT_SECS` |
-| Control connection idle timeout (secs) | `timeouts.idle_timeout_secs` | `GATEWAY_IDLE_TIMEOUT_SECS` |
-| Backend command response timeout (secs) | `timeouts.command_timeout_secs` | `GATEWAY_COMMAND_TIMEOUT_SECS` |
-| Data connection idle timeout (secs) | `timeouts.data_idle_timeout_secs` | `GATEWAY_DATA_IDLE_TIMEOUT_SECS` |
-| Max control-line length (bytes) | `limits.max_command_line_bytes` | `GATEWAY_MAX_COMMAND_LINE_BYTES` |
-| Max concurrent connections per client IP | `limits.max_connections_per_ip` | `GATEWAY_MAX_CONNECTIONS_PER_IP` |
+| Setting | Config path | Environment variable | Default |
+|---|---|---|---|
+| Control listen address | `listen.address` | `GATEWAY_LISTEN_ADDRESS` | `0.0.0.0` |
+| Control listen port | `listen.port` | `GATEWAY_LISTEN_PORT` | `21` |
+| Address advertised in PASV replies | `passive.address` | `GATEWAY_PASSIVE_ADDRESS` | `0.0.0.0` |
+| PASV port range start | `passive.port_range.start` | `GATEWAY_PASSIVE_PORT_RANGE_START` | `10000` |
+| PASV port range end | `passive.port_range.end` | `GATEWAY_PASSIVE_PORT_RANGE_END` | `20000` |
+| Backend servers | `backends` | `GATEWAY_BACKENDS` (`host:port,host:port`) | *(required — startup fails if empty)* |
+| Backend connect timeout (secs) | `timeouts.connection_timeout_secs` | `GATEWAY_CONNECTION_TIMEOUT_SECS` | `10` |
+| Control connection idle timeout (secs) | `timeouts.idle_timeout_secs` | `GATEWAY_IDLE_TIMEOUT_SECS` | `300` |
+| Backend command response timeout (secs) | `timeouts.command_timeout_secs` | `GATEWAY_COMMAND_TIMEOUT_SECS` | `30` |
+| Data connection idle timeout (secs) | `timeouts.data_idle_timeout_secs` | `GATEWAY_DATA_IDLE_TIMEOUT_SECS` | `60` |
+| Max control-line length (bytes) | `limits.max_command_line_bytes` | `GATEWAY_MAX_COMMAND_LINE_BYTES` | `4096` |
+| Max concurrent connections per client IP | `limits.max_connections_per_ip` | `GATEWAY_MAX_CONNECTIONS_PER_IP` | `10` (`0` disables) |
+| Metrics endpoint bind address | `metrics.address` | `GATEWAY_METRICS_ADDRESS` | `127.0.0.1` |
+| Metrics endpoint port | `metrics.port` | `GATEWAY_METRICS_PORT` | *(unset — endpoint disabled)* |
 
 A control line (a client command or a backend reply) that exceeds `max_command_line_bytes`
 without a terminating newline ends the session — a client hits `500 Command line too long`; a
@@ -227,6 +273,43 @@ Connection loss is expected on mobile IoT networks, not exceptional: a client di
 (cleanly or via a reset/broken pipe) is logged at INFO ("client disconnected"), while a backend
 failure or timeout is logged at WARN ("backend connection failed") — normal client churn should
 never show up as a warning.
+
+## Metrics
+
+Opt-in `GET /metrics` HTTP endpoint in [Prometheus text exposition
+format](https://github.com/prometheus/docs/blob/main/content/docs/instrumenting/exposition_formats.md),
+disabled by default. Set `metrics.port` / `GATEWAY_METRICS_PORT` to enable it, on its own TCP
+port — separate from the FTP control port, since the two protocols can't share one:
+
+```sh
+GATEWAY_METRICS_PORT=9273 cargo run -- --config path/to/config.yaml
+curl http://127.0.0.1:9273/metrics
+```
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `ftp_gateway_sessions_active` | gauge | FTP control connections currently open |
+| `ftp_gateway_uploads_active` | gauge | `STOR` transfers currently in progress |
+| `ftp_gateway_pasv_ports_active` | gauge | PASV/EPSV data ports currently allocated |
+| `ftp_gateway_sessions_total` | counter | Total control connections accepted |
+| `ftp_gateway_upload_bytes_total` | counter | Total bytes relayed to a Backend across all completed `STOR` transfers |
+| `ftp_gateway_connections_rejected_total` | counter | Total connections rejected by the per-IP connection limit |
+
+Every `_total` counter uses saturating addition, so it holds at `u64::MAX` under sustained load
+instead of wrapping back to a small number.
+
+By default `metrics.address` / `GATEWAY_METRICS_ADDRESS` binds to loopback (`127.0.0.1`) only —
+this endpoint carries no per-client secrets (no filenames, IPs, or credentials), but it also
+isn't meant to be reachable straight from the Internet by default. A sidecar/same-pod Prometheus
+scraper (the common Kubernetes shape) reaches loopback fine; set this to `0.0.0.0` (and publish
+the port, e.g. in `docker-compose.yml`) if something outside the container/pod needs to scrape
+it directly.
+
+The HTTP responder is hand-written rather than pulling in a framework (this gateway already
+hand-writes the FTP side, and the endpoint only ever needs to answer `GET /metrics`): it bounds
+request-line and header sizes, applies a read timeout against slow/stalled clients, serves
+exactly one request per connection and then closes it, and returns `404`/`405` rather than
+panicking on anything it doesn't recognize.
 
 ## Changelog
 

@@ -10,6 +10,24 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.9.4] - 2026-09-14
+
+### Added
+
+- `GET /metrics` HTTP endpoint in Prometheus text exposition format, exposing
+  `ftp_gateway_sessions_active`, `ftp_gateway_uploads_active`, `ftp_gateway_pasv_ports_active`,
+  `ftp_gateway_sessions_total`, `ftp_gateway_upload_bytes_total`, and
+  `ftp_gateway_connections_rejected_total`. Opt-in via `metrics.port` / `GATEWAY_METRICS_PORT`,
+  on a separate TCP port from the FTP listener, bound to loopback by default
+  (`metrics.address` / `GATEWAY_METRICS_ADDRESS`).
+
+### Security
+
+- The metrics HTTP responder bounds request-line and header sizes, applies a read timeout
+  against slowloris-style clients, serves exactly one request per connection, and never panics
+  on malformed input. All `*_total` counters use saturating addition so they hold at `u64::MAX`
+  under sustained load instead of wrapping.
+
 ## [2026.9.3] - 2026-09-14
 
 ### Added
@@ -91,7 +109,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.3...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.4...HEAD
+[2026.9.4]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.3...v2026.9.4
 [2026.9.3]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.2...v2026.9.3
 [2026.9.2]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.1...v2026.9.2
 [2026.9.1]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.0...v2026.9.1
