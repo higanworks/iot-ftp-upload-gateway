@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -7,11 +8,12 @@ use tokio::task::JoinSet;
 
 use crate::backend::selector::BackendSelector;
 use crate::config::Config;
+use crate::metrics::Metrics;
 use crate::pasv::port_manager::PortManager;
 use crate::shutdown;
 
 use super::ip_limiter::IpConnectionLimiter;
-use super::session;
+use super::{metrics_server, session};
 
 /// How long to wait for in-flight sessions to finish on their own after a shutdown
 /// signal is received, before exiting regardless of what is still running.
@@ -31,7 +33,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let port_manager = PortManager::new(config.passive.port_range);
     let backend_selector = BackendSelector::new(config.backends.clone());
     let ip_limiter = IpConnectionLimiter::new(config.limits.max_connections_per_ip);
+    let metrics = Metrics::new();
     let mut sessions = JoinSet::new();
+
+    if let Some(metrics_port) = config.metrics.port {
+        let metrics_addr = SocketAddr::new(config.metrics.address, metrics_port);
+        let metrics = Arc::clone(&metrics);
+        let port_manager = port_manager.clone();
+        tokio::spawn(async move {
+            if let Err(err) = metrics_server::run(metrics_addr, metrics, port_manager).await {
+                tracing::warn!(error = %err, "metrics endpoint stopped");
+            }
+        });
+    }
 
     let shutdown_signal = shutdown::wait_for_shutdown_signal();
     tokio::pin!(shutdown_signal);
@@ -58,6 +72,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 };
                 let Some(ip_guard) = ip_limiter.try_acquire(peer_addr.ip()) else {
                     tracing::warn!(%peer_addr, "connection limit reached for this IP");
+                    metrics.connection_rejected();
                     continue;
                 };
 
@@ -69,6 +84,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 let timeouts = config.timeouts;
                 let limits = config.limits;
                 let port_manager = port_manager.clone();
+                let metrics = Arc::clone(&metrics);
 
                 sessions.spawn(async move {
                     // Held for the whole session so its slot in `ip_limiter` is released
@@ -83,6 +99,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         timeouts,
                         limits,
                         port_manager,
+                        metrics,
                     )
                     .await
                     {

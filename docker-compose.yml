@@ -56,11 +56,16 @@ services:
       GATEWAY_PASSIVE_ADDRESS: "127.0.0.1"
       GATEWAY_PASSIVE_PORT_RANGE_START: "18100"
       GATEWAY_PASSIVE_PORT_RANGE_END: "18120"
-      RUST_LOG: "info"
+      # Bound to 0.0.0.0, not the loopback-only default: a docker-compose `ports:` mapping can
+      # only forward to a container's real network interface, not to its `lo`.
+      GATEWAY_METRICS_ADDRESS: "0.0.0.0"
+      GATEWAY_METRICS_PORT: "9273"
+      RUST_LOG: "debug"
       # GATEWAY_LOG_FORMAT: "json"
     ports:
       - "2131:2131"
       - "18100-18120:18100-18120"
+      - "9273:9273"
 
 networks:
   ftp_net:

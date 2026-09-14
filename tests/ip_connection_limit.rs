@@ -39,6 +39,7 @@ async fn extra_connection_beyond_the_per_ip_limit_is_rejected() {
             max_connections_per_ip: 2,
             ..LimitsConfig::default()
         },
+        metrics: Default::default(),
     };
     let gateway_addr = SocketAddr::new(config.listen.address, config.listen.port);
 

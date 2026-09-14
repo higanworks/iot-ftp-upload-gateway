@@ -239,6 +239,7 @@ pub async fn spawn_session_with_limits(
             timeouts,
             limits,
             port_manager,
+            iot_ftp_upload_gateway::metrics::Metrics::new(),
         )
         .await
     });

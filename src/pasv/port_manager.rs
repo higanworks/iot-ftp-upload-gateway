@@ -56,6 +56,12 @@ impl PortManager {
         }
         None
     }
+
+    /// Number of PASV/EPSV ports currently allocated, for the `ftp_gateway_pasv_ports_active`
+    /// metric (`src/metrics.rs`).
+    pub fn active_count(&self) -> usize {
+        self.in_use.lock().unwrap().len()
+    }
 }
 
 /// An allocated PASV port. Automatically released back to the pool when dropped.
@@ -84,6 +90,27 @@ impl Drop for PasvPortGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_count_tracks_allocation_and_release() {
+        let manager = PortManager::new(PortRange {
+            start: 19500,
+            end: 19502,
+        });
+        assert_eq!(manager.active_count(), 0);
+
+        let guard1 = manager.allocate().await.expect("first port available");
+        assert_eq!(manager.active_count(), 1);
+
+        let guard2 = manager.allocate().await.expect("second port available");
+        assert_eq!(manager.active_count(), 2);
+
+        drop(guard1);
+        assert_eq!(manager.active_count(), 1);
+
+        drop(guard2);
+        assert_eq!(manager.active_count(), 0);
+    }
 
     #[tokio::test]
     async fn allocates_port_within_range() {
