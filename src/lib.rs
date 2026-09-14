@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config;
+pub mod metrics;
 pub mod pasv;
 pub mod protocol;
 pub mod server;

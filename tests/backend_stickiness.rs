@@ -44,6 +44,7 @@ async fn control_and_data_stay_on_the_backend_assigned_at_session_start() {
             .collect(),
         timeouts: TimeoutConfig::default(),
         limits: LimitsConfig::default(),
+        metrics: Default::default(),
     };
     let gateway_addr = SocketAddr::new(config.listen.address, config.listen.port);
 

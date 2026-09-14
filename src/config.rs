@@ -15,6 +15,7 @@ pub struct Config {
     pub backends: Vec<BackendConfig>,
     pub timeouts: TimeoutConfig,
     pub limits: LimitsConfig,
+    pub metrics: MetricsConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -125,6 +126,31 @@ impl Default for LimitsConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct MetricsConfig {
+    /// Address the `/metrics` HTTP endpoint binds to. Defaults to loopback-only, not
+    /// `listen.address`'s `0.0.0.0` default -- this endpoint carries no per-client secrets, but
+    /// it isn't meant to be reachable straight from the Internet either; an operator who wants
+    /// it reachable from outside the host (e.g. a Prometheus server on another machine) must
+    /// opt in explicitly via `GATEWAY_METRICS_ADDRESS`.
+    pub address: IpAddr,
+    /// TCP port the `/metrics` HTTP endpoint listens on. Distinct from `listen.port` (which
+    /// speaks only FTP, not HTTP) since the two protocols can't share one port. `None` (the
+    /// default) disables the metrics endpoint entirely -- opt-in, matching this gateway's
+    /// general posture of not exposing anything not explicitly configured.
+    pub port: Option<u16>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        MetricsConfig {
+            address: IpAddr::from([127, 0, 0, 1]),
+            port: None,
+        }
+    }
+}
+
 impl Config {
     /// Loads the YAML file at `config_path` if given, then layers environment variables on top.
     pub fn load(config_path: Option<&Path>) -> Result<Config> {
@@ -193,6 +219,12 @@ impl Config {
             self.limits.max_connections_per_ip = v
                 .parse()
                 .context("invalid GATEWAY_MAX_CONNECTIONS_PER_IP")?;
+        }
+        if let Some(v) = env_var("GATEWAY_METRICS_ADDRESS")? {
+            self.metrics.address = v.parse().context("invalid GATEWAY_METRICS_ADDRESS")?;
+        }
+        if let Some(v) = env_var("GATEWAY_METRICS_PORT")? {
+            self.metrics.port = Some(v.parse().context("invalid GATEWAY_METRICS_PORT")?);
         }
         Ok(())
     }

@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -7,6 +8,7 @@ use tokio::net::TcpStream;
 
 use crate::backend;
 use crate::config::{BackendConfig, LimitsConfig, PassiveConfig, TimeoutConfig};
+use crate::metrics::Metrics;
 use crate::pasv::port_manager::{PasvPortGuard, PortManager};
 use crate::pasv::relay;
 use crate::protocol::command::{FtpCommand, escape_control_chars, has_embedded_line_break};
@@ -98,7 +100,7 @@ async fn read_line_with_timeout(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "session",
-    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager),
+    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager, metrics),
     fields(
         session_id = session_id,
         client_ip = %peer_addr.ip(),
@@ -115,8 +117,10 @@ pub async fn handle(
     timeouts: TimeoutConfig,
     limits: LimitsConfig,
     port_manager: PortManager,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     tracing::info!("session started");
+    let _session_guard = metrics.session_started();
 
     let connection_timeout = Duration::from_secs(timeouts.connection_timeout_secs);
     let idle_timeout = Duration::from_secs(timeouts.idle_timeout_secs);
@@ -317,6 +321,7 @@ pub async fn handle(
                         client_io!(client_conn.write_all(backend_reply.as_bytes()).await);
 
                         // Move the file bytes only after the backend confirmed it is ready (150).
+                        let _upload_guard = metrics.upload_started();
                         let relay_result = relay::relay_bidirectional(
                             &mut channel.client_data,
                             &mut channel.backend_data,
@@ -325,6 +330,7 @@ pub async fn handle(
                         .await;
                         match relay_result {
                             Ok((bytes_uploaded, _)) => {
+                                metrics.add_upload_bytes(bytes_uploaded);
                                 tracing::info!(%filename_log, bytes_uploaded, "upload data transferred");
                             }
                             Err(err) => {

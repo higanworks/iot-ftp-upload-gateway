@@ -47,6 +47,7 @@ async fn spawn_session(
             timeouts,
             LimitsConfig::default(),
             port_manager,
+            iot_ftp_upload_gateway::metrics::Metrics::new(),
         )
         .await
         .unwrap();
