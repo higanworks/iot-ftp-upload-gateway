@@ -205,6 +205,20 @@ pub async fn handle(
                 // QUIT ending the session) are already logged at INFO in their own right below.
                 tracing::debug!(command = %command.as_log_str(), "received command");
 
+                if let FtpCommand::Unknown(_) = command {
+                    // Only the commands PROJECT_SECURITY.md section 2 lists as supported are
+                    // ever forwarded to the Backend -- an unrecognized verb (RETR, DELE, LIST,
+                    // ...) is rejected here rather than relayed, keeping the Gateway's attack
+                    // surface limited to what it actually implements.
+                    tracing::warn!(command = %command.as_log_str(), "rejected unsupported command");
+                    client_io!(
+                        client_conn
+                            .write_all(b"502 Command not implemented\r\n")
+                            .await
+                    );
+                    continue;
+                }
+
                 if matches!(command, FtpCommand::Pasv | FtpCommand::Epsv) {
                     if let Some(old) = active_pasv.take() {
                         tracing::info!(port = old.port(), "PASV port released (replaced by new PASV)");

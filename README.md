@@ -8,9 +8,9 @@ publishing a huge PASV port range per backend, and without running a general-pur
 ## Scope
 
 Only the commands an IoT device needs to upload a file are implemented: `USER`, `PASS`,
-`SYST`, `TYPE`, `PWD`, `CWD`, `PASV`, `EPSV`, `STOR`, `QUIT`, `NOOP`. IPv4 and passive mode
-only; no FTPS/TLS, no Active mode, no IPv6, no general FTP command support (`RETR`, `LIST`,
-`PORT`, etc. are not implemented).
+`SYST`, `TYPE`, `PWD`, `CWD`, `PASV`, `EPSV`, `STOR`, `MKD`, `QUIT`, `NOOP`. Any other command
+(`RETR`, `LIST`, `PORT`, etc.) is rejected with `502` and never reaches a Backend. IPv4 and
+passive mode only; no FTPS/TLS, no Active mode, no IPv6, no general FTP command support.
 
 `EPSV` (RFC 2428) is accepted alongside `PASV` and shares the exact same port pool and data
 relay — some clients (and any client whose control connection happens to be IPv6, since PASV's

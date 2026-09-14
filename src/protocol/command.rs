@@ -44,6 +44,7 @@ pub enum FtpCommand {
     Pasv,
     Epsv,
     Stor(String),
+    Mkd(String),
     Quit,
     Noop,
     Unknown(String),
@@ -69,6 +70,7 @@ impl FtpCommand {
             // this gateway is IPv4-only, so any EPSV request is handled the same way.
             "EPSV" => FtpCommand::Epsv,
             "STOR" => FtpCommand::Stor(rest.to_string()),
+            "MKD" => FtpCommand::Mkd(rest.to_string()),
             "QUIT" => FtpCommand::Quit,
             "NOOP" => FtpCommand::Noop,
             other => FtpCommand::Unknown(other.to_string()),
@@ -87,6 +89,7 @@ impl FtpCommand {
             FtpCommand::Pasv => "PASV".to_string(),
             FtpCommand::Epsv => "EPSV".to_string(),
             FtpCommand::Stor(arg) => format!("STOR {}", escape_control_chars(arg)),
+            FtpCommand::Mkd(arg) => format!("MKD {}", escape_control_chars(arg)),
             FtpCommand::Quit => "QUIT".to_string(),
             FtpCommand::Noop => "NOOP".to_string(),
             FtpCommand::Unknown(verb) => format!("UNKNOWN {}", escape_control_chars(verb)),
@@ -134,6 +137,14 @@ mod tests {
     fn parses_epsv_ignoring_protocol_argument() {
         assert_eq!(FtpCommand::parse("EPSV"), FtpCommand::Epsv);
         assert_eq!(FtpCommand::parse("EPSV 2"), FtpCommand::Epsv);
+    }
+
+    #[test]
+    fn parses_mkd_with_argument() {
+        assert_eq!(
+            FtpCommand::parse("MKD sub/dir"),
+            FtpCommand::Mkd("sub/dir".to_string())
+        );
     }
 
     #[test]

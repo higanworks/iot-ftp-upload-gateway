@@ -24,9 +24,13 @@ use tokio::task::JoinHandle;
 /// Files "uploaded" to a mock backend so far: `(filename, content)`.
 pub type UploadedFiles = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
+/// Directory names the mock backend has seen an `MKD` for so far.
+pub type CreatedDirs = Arc<Mutex<Vec<String>>>;
+
 pub struct MockBackend {
     pub addr: SocketAddr,
     pub uploads: UploadedFiles,
+    pub created_dirs: CreatedDirs,
 }
 
 /// Starts a mock backend on an ephemeral port and returns immediately; it keeps accepting
@@ -35,27 +39,41 @@ pub async fn spawn_mock_backend() -> MockBackend {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let uploads: UploadedFiles = Arc::new(Mutex::new(Vec::new()));
+    let created_dirs: CreatedDirs = Arc::new(Mutex::new(Vec::new()));
 
     let uploads_for_task = uploads.clone();
+    let created_dirs_for_task = created_dirs.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
-            tokio::spawn(handle_control(stream, uploads_for_task.clone()));
+            tokio::spawn(handle_control(
+                stream,
+                uploads_for_task.clone(),
+                created_dirs_for_task.clone(),
+            ));
         }
     });
 
-    MockBackend { addr, uploads }
+    MockBackend {
+        addr,
+        uploads,
+        created_dirs,
+    }
 }
 
-async fn handle_control(stream: TcpStream, uploads: UploadedFiles) {
+async fn handle_control(stream: TcpStream, uploads: UploadedFiles, created_dirs: CreatedDirs) {
     let mut conn = BufReader::new(stream);
     if conn.write_all(b"220 Mock backend ready\r\n").await.is_err() {
         return;
     }
 
     let mut pending_data: Option<TcpListener> = None;
+    // Directories this control connection has `MKD`'d so far -- lets `CWD` mimic a real FTP
+    // server's "550 no such directory" until the directory has actually been created, which is
+    // what makes a client's `--ftp-create-dirs`-style CWD/MKD/CWD dance exercise anything real.
+    let mut known_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut line = String::new();
 
     loop {
@@ -78,6 +96,20 @@ async fn handle_control(stream: TcpStream, uploads: UploadedFiles) {
             let _ = conn.write_all(b"257 \"/\"\r\n").await;
         } else if upper.starts_with("TYPE") {
             let _ = conn.write_all(b"200 Type set\r\n").await;
+        } else if upper.starts_with("CWD") {
+            let path = trimmed.get(4..).unwrap_or_default();
+            if path == "/" || known_dirs.contains(path) {
+                let _ = conn.write_all(b"250 CWD command successful\r\n").await;
+            } else {
+                let _ = conn.write_all(b"550 No such directory\r\n").await;
+            }
+        } else if upper.starts_with("MKD") {
+            let path = trimmed.get(4..).unwrap_or_default().to_string();
+            known_dirs.insert(path.clone());
+            created_dirs.lock().unwrap().push(path.clone());
+            let _ = conn
+                .write_all(format!("257 \"{path}\" created\r\n").as_bytes())
+                .await;
         } else if upper.starts_with("PASV") {
             let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let data_port = data_listener.local_addr().unwrap().port();
@@ -99,7 +131,12 @@ async fn handle_control(stream: TcpStream, uploads: UploadedFiles) {
             let _ = conn.write_all(b"221 Goodbye\r\n").await;
             break;
         } else {
-            let _ = conn.write_all(b"502 Command not implemented\r\n").await;
+            // Distinct wording from the Gateway's own "502 Command not implemented" rejection
+            // (src/server/session.rs) so a test can tell whether a reply came from the Gateway's
+            // allow-list check or actually reached this mock backend.
+            let _ = conn
+                .write_all(b"502 Mock backend: unrecognized command\r\n")
+                .await;
         }
     }
 }
