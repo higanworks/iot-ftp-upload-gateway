@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "iot-ftp-upload-gateway"
-version = "2026.9.3"
+version = "2026.9.4"
 dependencies = [
  "anyhow",
  "clap",
