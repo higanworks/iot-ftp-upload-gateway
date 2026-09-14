@@ -228,6 +228,51 @@ services:
 The EC2 Security Group must allow inbound access to the control port and the full configured
 PASV port range — there is no Docker port mapping to fall back on with host networking.
 
+#### Host kernel tuning
+
+With `network_mode: host` and many concurrent long-lived sessions (see *Resource limits* under
+[Operational notes](#operational-notes) below), a few kernel settings are worth setting ahead of
+load rather than discovering under it:
+
+```ini
+# /etc/sysctl.d/99-iot-ftp-upload-gateway.conf
+
+# Ephemeral port range: the gateway opens its own outbound connection to each Backend for
+# every session's control connection and every STOR's data connection (it acts as a PASV
+# *client* toward Backends -- see relay::open_backend_data_connection). Widen this if
+# concurrent sessions approach the default range's ~28000 ports.
+net.ipv4.ip_local_port_range = 10240 65535
+
+# Mobile IoT devices reconnect often -- connection loss is expected, normal operation, not
+# exceptional (see the client_io! handling in server/session.rs). The resulting TIME_WAIT
+# churn can eat into the ephemeral port range faster than a steadier workload would. Reusing
+# TIME_WAIT sockets for new outgoing connections is safe; shortening FIN_WAIT2 reclaims them
+# sooner too.
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 30
+
+# System-wide file descriptor ceiling -- distinct from (and must be >= ) the process-level
+# `nofile` ulimit described under Resource limits below.
+fs.file-max = 262144
+
+# Accept-queue depth, for a burst of devices reconnecting at once after a network blip rather
+# than a steady trickle.
+net.core.somaxconn = 4096
+net.ipv4.tcp_max_syn_backlog = 4096
+```
+
+```sh
+sudo sysctl --system   # applies immediately; also picked up on reboot
+```
+
+Raise the process's own open-file ulimit to match (systemd unit `LimitNOFILE=`, or Docker's
+`--ulimit nofile=<n>:<n>` / compose `ulimits:`) — sized as described under *Resource limits*
+below, not left at the kernel/shell default.
+
+**Not recommended:** `net.ipv4.tcp_tw_recycle` — removed from the kernel since Linux 4.12, and
+even where still present, breaks clients sitting behind NAT (exactly where many IoT devices
+are). `tcp_tw_reuse` above is the safe replacement for the same problem.
+
 ## Operational notes
 
 **Resource limits.** One active upload holds roughly four sockets/file descriptors at once:
