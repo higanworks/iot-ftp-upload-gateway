@@ -7,8 +7,7 @@ mod common;
 use std::net::Ipv4Addr;
 
 use common::{
-    await_session, connect_with_retry, login, perform_upload, read_reply,
-    spawn_session_with_limits,
+    await_session, connect_with_retry, login, perform_upload, read_reply, spawn_session_with_limits,
 };
 use iot_ftp_upload_gateway::config::{
     BackendConfig, LimitsConfig, PassiveConfig, PortRange, TimeoutConfig,
