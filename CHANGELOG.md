@@ -10,6 +10,16 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.9.2] - 2026-09-14
+
+### Security
+
+- The control-line reader now rejects any command whose argument still contains an embedded CR
+  or LF after the trailing line terminator is stripped, responding `501` instead of forwarding
+  it. Previously such a line was relayed to the Backend verbatim, so a crafted argument (e.g. a
+  `STOR` filename) could smuggle a second command past the Backend (PROJECT_SECURITY.md section
+  4).
+
 ## [2026.9.1] - 2026-09-13
 
 ### Added
@@ -66,7 +76,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.1...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.2...HEAD
+[2026.9.2]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.1...v2026.9.2
 [2026.9.1]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.0...v2026.9.1
 [2026.9.0]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v0.1.0...v2026.9.0
 [0.1.0]: https://github.com/higanworks/iot-ftp-upload-gateway/releases/tag/v0.1.0
