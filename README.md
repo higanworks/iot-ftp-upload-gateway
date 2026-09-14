@@ -356,6 +356,11 @@ request-line and header sizes, applies a read timeout against slow/stalled clien
 exactly one request per connection and then closes it, and returns `404`/`405` rather than
 panicking on anything it doesn't recognize.
 
+No CloudWatch/Prometheus integration ships with the gateway itself, but
+[samples/cloudwatch_metrics.py](samples/cloudwatch_metrics.py) is a reference script that
+scrapes this endpoint and publishes the values as CloudWatch custom metrics — see
+[samples/README.md](samples/README.md) for usage and a systemd timer example.
+
 ## Changelog
 
 See [CHANGELOG.md](CHANGELOG.md).
