@@ -10,6 +10,21 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.9.3] - 2026-09-14
+
+### Added
+
+- `MKD` support, so clients like `curl --ftp-create-dirs` can create the directories a `STOR`
+  path implies (it `CWD`s into each path component, `MKD` + retries `CWD` on a `550`, then
+  `STOR`s the bare filename).
+
+### Security
+
+- Unrecognized commands (`RETR`, `DELE`, `LIST`, etc.) are now rejected with `502` instead of
+  being forwarded to the Backend. Previously any command not special-cased for
+  `PASV`/`EPSV`/`STOR` was relayed verbatim regardless of whether the Gateway recognized it;
+  only the commands PROJECT_SECURITY.md section 2 lists as supported are now ever forwarded.
+
 ## [2026.9.2] - 2026-09-14
 
 ### Security
@@ -76,7 +91,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.2...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.3...HEAD
+[2026.9.3]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.2...v2026.9.3
 [2026.9.2]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.1...v2026.9.2
 [2026.9.1]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.0...v2026.9.1
 [2026.9.0]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v0.1.0...v2026.9.0
