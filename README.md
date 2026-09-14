@@ -32,9 +32,8 @@ make check   # fmt-check + clippy + test
 ## Releases
 
 Versions follow CalVer: `vYYYY.M.PATCH` (year, non-zero-padded month, and a patch number that
-resets to `0` at the start of each new year/month) — e.g. `v2026.9.0`. `v0.1.0` was released
-under the project's original SemVer scheme, before this switch; every version from `v2026.9.0`
-onward is CalVer. See [CHANGELOG.md](CHANGELOG.md) for what changed in each release.
+resets to `0` at the start of each new year/month) — e.g. `v2026.9.0`. See
+[CHANGELOG.md](CHANGELOG.md) for what changed in each release.
 
 Pushing a version tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which publishes a GitHub Release with prebuilt Linux binaries (`x86_64` and `aarch64`, built
