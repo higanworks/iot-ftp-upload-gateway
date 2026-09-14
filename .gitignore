@@ -1,3 +1,5 @@
 /target
 PROJECT*.md
 z_*.md
+__pycache__/
+*.pyc
