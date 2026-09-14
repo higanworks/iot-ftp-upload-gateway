@@ -9,7 +9,7 @@ use crate::backend;
 use crate::config::{BackendConfig, LimitsConfig, PassiveConfig, TimeoutConfig};
 use crate::pasv::port_manager::{PasvPortGuard, PortManager};
 use crate::pasv::relay;
-use crate::protocol::command::{FtpCommand, escape_control_chars};
+use crate::protocol::command::{FtpCommand, escape_control_chars, has_embedded_line_break};
 use crate::protocol::reply;
 
 /// A data connection ready to relay: the client's side has connected to the Gateway's PASV
@@ -182,7 +182,23 @@ pub async fn handle(
                     break;
                 }
 
-                let command = FtpCommand::parse(line.trim_end_matches(['\r', '\n']));
+                let trimmed_line = line.trim_end_matches(['\r', '\n']);
+                if has_embedded_line_break(trimmed_line) {
+                    // A CR or LF survived inside what the control-line reader treated as a
+                    // single command -- forwarding `line` as-is could let the Backend split it
+                    // into two commands (PROJECT_SECURITY.md section 4). Reject outright rather
+                    // than forwarding any part of it.
+                    tracing::warn!(
+                        "rejected command line containing embedded CR/LF (possible command injection attempt)"
+                    );
+                    client_io!(
+                        client_conn
+                            .write_all(b"501 Syntax error in parameters or arguments\r\n")
+                            .await
+                    );
+                    continue;
+                }
+                let command = FtpCommand::parse(trimmed_line);
                 // Raw per-command traffic is high-volume and low-signal for normal operation
                 // (CloudWatch Logs Insights bills per byte ingested) -- kept at DEBUG rather
                 // than INFO; the commands that matter operationally (PASV/STOR outcomes,
