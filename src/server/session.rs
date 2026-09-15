@@ -136,13 +136,8 @@ pub async fn handle(
     let data_idle_timeout = Duration::from_secs(timeouts.data_idle_timeout_secs);
     let max_command_line_bytes = limits.max_command_line_bytes;
 
-    let backend_stream = match backend::connection::connect(
-        &backend_config,
-        connection_timeout,
-        &dns_cache,
-    )
-    .await
-    {
+    let backend_stream =
+        match backend::connection::connect(&backend_config, connection_timeout, &dns_cache).await {
             Ok(stream) => stream,
             Err(err) => {
                 tracing::warn!(error = %err, "failed to connect to backend");
