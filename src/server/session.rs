@@ -122,6 +122,12 @@ pub async fn handle(
     tracing::info!("session started");
     let _session_guard = metrics.session_started();
 
+    // The control connection is a long-running series of small one-line command/reply round
+    // trips; leaving Nagle's algorithm enabled would add its characteristic latency to each one.
+    if let Err(err) = client.set_nodelay(true) {
+        tracing::debug!(error = %err, "failed to set TCP_NODELAY on client connection");
+    }
+
     let connection_timeout = Duration::from_secs(timeouts.connection_timeout_secs);
     let idle_timeout = Duration::from_secs(timeouts.idle_timeout_secs);
     let command_timeout = Duration::from_secs(timeouts.command_timeout_secs);

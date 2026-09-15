@@ -50,9 +50,19 @@ pub async fn relay_bidirectional(
     )
 }
 
+/// Size of the buffer used to shuttle bytes between the client and backend data connections.
+/// Larger than a typical default (8 KiB) to cut the number of read/write syscalls per MB
+/// transferred during bulk uploads, this gateway's core workload.
+const RELAY_BUFFER_BYTES: usize = 65536;
+
 /// Copies from `reader` to `writer` until EOF, shutting down `writer` when the source is
 /// exhausted (preserving TCP half-close: the other direction of the pair keeps running
 /// independently). Returns a `TimedOut` error if no byte is read within `idle_timeout`.
+///
+/// The idle timer is a single `Sleep` reset on every read rather than a fresh
+/// `tokio::time::timeout` per call: re-wrapping every read would register and cancel a new
+/// timer-wheel entry for every `RELAY_BUFFER_BYTES` chunk moved, for the whole duration of every
+/// transfer -- the hottest loop in the gateway.
 async fn copy_with_idle_timeout<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -62,24 +72,32 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; RELAY_BUFFER_BYTES];
     let mut total = 0u64;
+    let sleep = tokio::time::sleep(idle_timeout);
+    tokio::pin!(sleep);
     loop {
-        let read = match tokio::time::timeout(idle_timeout, reader.read(&mut buf)).await {
-            Ok(result) => result?,
-            Err(_) => {
+        tokio::select! {
+            biased;
+
+            read_result = reader.read(&mut buf) => {
+                let read = read_result?;
+                if read == 0 {
+                    writer.shutdown().await?;
+                    return Ok(total);
+                }
+                writer.write_all(&buf[..read]).await?;
+                total += read as u64;
+                sleep.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+            }
+
+            _ = &mut sleep => {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "data connection idle timeout",
                 ));
             }
-        };
-        if read == 0 {
-            writer.shutdown().await?;
-            return Ok(total);
         }
-        writer.write_all(&buf[..read]).await?;
-        total += read as u64;
     }
 }
 
