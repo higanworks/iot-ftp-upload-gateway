@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpListener;
@@ -18,6 +19,7 @@ use crate::config::PortRange;
 pub struct PortManager {
     in_use: Arc<Mutex<HashSet<u16>>>,
     range: PortRange,
+    next_offset: Arc<AtomicU32>,
 }
 
 impl PortManager {
@@ -25,12 +27,25 @@ impl PortManager {
         PortManager {
             in_use: Arc::new(Mutex::new(HashSet::new())),
             range,
+            next_offset: Arc::new(AtomicU32::new(0)),
         }
     }
 
     /// Finds a free port and binds it. Returns None if the range has no free port.
+    ///
+    /// Starts the search just after wherever the previous call left off (wrapping around the
+    /// range) rather than always rescanning from `range.start`: under a busy pool, always
+    /// starting at the front would mean every allocation re-walks however many ports at the
+    /// front are already taken before reaching a free one, and that walk (a mutex lock plus a
+    /// bind attempt per candidate) gets more expensive the busier the pool is. A rotating start
+    /// point keeps each allocation's search close to O(1) in the common case instead.
     pub async fn allocate(&self) -> Option<PasvPortGuard> {
-        for port in self.range.start..=self.range.end {
+        let range_size = self.range.end as u32 - self.range.start as u32 + 1;
+
+        for _ in 0..range_size {
+            let offset = self.next_offset.fetch_add(1, Ordering::Relaxed) % range_size;
+            let port = self.range.start + offset as u16;
+
             let reserved = {
                 let mut in_use = self.in_use.lock().unwrap();
                 in_use.insert(port)
@@ -148,6 +163,27 @@ mod tests {
             .await
             .expect("port available again after release");
         assert_eq!(guard2.port(), port);
+    }
+
+    #[tokio::test]
+    async fn rotates_start_point_instead_of_always_restarting_from_range_start() {
+        let manager = PortManager::new(PortRange {
+            start: 19600,
+            end: 19602,
+        });
+
+        let guard1 = manager.allocate().await.expect("first port available");
+        assert_eq!(guard1.port(), 19600);
+
+        let guard2 = manager.allocate().await.expect("second port available");
+        assert_eq!(guard2.port(), 19601);
+
+        drop(guard1);
+
+        // With 19600 free again, a "rescan from range.start every time" allocator would hand it
+        // right back out. The rotating cursor instead keeps moving forward to 19602.
+        let guard3 = manager.allocate().await.expect("third port available");
+        assert_eq!(guard3.port(), 19602);
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ mod common;
 
 use std::net::Ipv4Addr;
 
+use iot_ftp_upload_gateway::backend::dns_cache::DnsCache;
 use iot_ftp_upload_gateway::config::{
     BackendConfig, LimitsConfig, PassiveConfig, PortRange, TimeoutConfig,
 };
@@ -48,6 +49,7 @@ async fn spawn_session(
             LimitsConfig::default(),
             port_manager,
             iot_ftp_upload_gateway::metrics::Metrics::new(),
+            DnsCache::new(),
         )
         .await
         .unwrap();

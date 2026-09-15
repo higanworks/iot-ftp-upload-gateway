@@ -13,6 +13,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use iot_ftp_upload_gateway::backend::dns_cache::DnsCache;
 use iot_ftp_upload_gateway::config::{BackendConfig, LimitsConfig, PassiveConfig, TimeoutConfig};
 use iot_ftp_upload_gateway::pasv::port_manager::PortManager;
 use iot_ftp_upload_gateway::protocol::reply::{parse_pasv_reply, pasv_reply};
@@ -240,6 +241,7 @@ pub async fn spawn_session_with_limits(
             limits,
             port_manager,
             iot_ftp_upload_gateway::metrics::Metrics::new(),
+            DnsCache::new(),
         )
         .await
     });

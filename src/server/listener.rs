@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
+use crate::backend::dns_cache::DnsCache;
 use crate::backend::selector::BackendSelector;
 use crate::config::Config;
 use crate::metrics::Metrics;
@@ -33,6 +34,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let port_manager = PortManager::new(config.passive.port_range);
     let backend_selector = BackendSelector::new(config.backends.clone());
     let ip_limiter = IpConnectionLimiter::new(config.limits.max_connections_per_ip);
+    let dns_cache = DnsCache::new();
     let metrics = Metrics::new();
     let mut sessions = JoinSet::new();
 
@@ -85,6 +87,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 let limits = config.limits;
                 let port_manager = port_manager.clone();
                 let metrics = Arc::clone(&metrics);
+                let dns_cache = dns_cache.clone();
 
                 sessions.spawn(async move {
                     // Held for the whole session so its slot in `ip_limiter` is released
@@ -100,6 +103,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         limits,
                         port_manager,
                         metrics,
+                        dns_cache,
                     )
                     .await
                     {

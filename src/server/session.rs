@@ -7,6 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::backend;
+use crate::backend::dns_cache::DnsCache;
 use crate::config::{BackendConfig, LimitsConfig, PassiveConfig, TimeoutConfig};
 use crate::metrics::Metrics;
 use crate::pasv::port_manager::{PasvPortGuard, PortManager};
@@ -100,7 +101,7 @@ async fn read_line_with_timeout(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "session",
-    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager, metrics),
+    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager, metrics, dns_cache),
     fields(
         session_id = session_id,
         client_ip = %peer_addr.ip(),
@@ -118,6 +119,7 @@ pub async fn handle(
     limits: LimitsConfig,
     port_manager: PortManager,
     metrics: Arc<Metrics>,
+    dns_cache: DnsCache,
 ) -> anyhow::Result<()> {
     tracing::info!("session started");
     let _session_guard = metrics.session_started();
@@ -134,8 +136,13 @@ pub async fn handle(
     let data_idle_timeout = Duration::from_secs(timeouts.data_idle_timeout_secs);
     let max_command_line_bytes = limits.max_command_line_bytes;
 
-    let backend_stream =
-        match backend::connection::connect(&backend_config, connection_timeout).await {
+    let backend_stream = match backend::connection::connect(
+        &backend_config,
+        connection_timeout,
+        &dns_cache,
+    )
+    .await
+    {
             Ok(stream) => stream,
             Err(err) => {
                 tracing::warn!(error = %err, "failed to connect to backend");
