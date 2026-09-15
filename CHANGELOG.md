@@ -10,6 +10,20 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.9.5] - 2026-09-16
+
+### Changed
+
+- Backend connections now resolve DNS through a 30-second cache instead of on every new
+  session, and enable `TCP_NODELAY` on both the client and backend control connections to avoid
+  Nagle-induced latency on their frequent small command/reply round trips.
+- The client-to-backend data relay buffer grew from 8 KiB to 64 KiB, and its idle-timeout
+  tracking switched from re-arming a timer on every read to a single timer reset on progress,
+  cutting per-chunk overhead during uploads.
+- PASV/EPSV port allocation now starts its search for a free port where the previous allocation
+  left off, instead of always rescanning from the start of the configured range, keeping
+  allocation cost low under a busy port pool.
+
 ## [2026.9.4] - 2026-09-14
 
 ### Added
@@ -109,7 +123,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.4...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.5...HEAD
+[2026.9.5]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.4...v2026.9.5
 [2026.9.4]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.3...v2026.9.4
 [2026.9.3]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.2...v2026.9.3
 [2026.9.2]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.1...v2026.9.2
