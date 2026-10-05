@@ -245,6 +245,7 @@ pub async fn spawn_session_with_limits(
             iot_ftp_upload_gateway::metrics::Metrics::new(),
             DnsCache::new(),
             None,
+            None,
         )
         .await
     });

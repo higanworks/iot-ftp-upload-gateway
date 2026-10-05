@@ -14,6 +14,7 @@ pub struct Config {
     pub passive: PassiveConfig,
     pub backends: Vec<BackendConfig>,
     pub backend_tls: BackendTlsConfig,
+    pub backend_source: BackendSourceConfig,
     pub timeouts: TimeoutConfig,
     pub limits: LimitsConfig,
     pub metrics: MetricsConfig,
@@ -55,11 +56,41 @@ impl Default for PassiveConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct PortRange {
     pub start: u16,
     pub end: u16,
+}
+
+impl PortRange {
+    /// Number of ports in the range (both ends inclusive).
+    pub fn len(&self) -> usize {
+        usize::from(self.end) - usize::from(self.start) + 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.end < self.start
+    }
+
+    /// Parses the `first:last` form, e.g. `8192:8200`. A single port is `8192:8192`.
+    fn parse_first_last(raw: &str) -> Result<PortRange> {
+        let (first, last) = raw
+            .split_once(':')
+            .with_context(|| format!("invalid port range '{raw}', expected first:last"))?;
+        let start: u16 = first
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid first port in range '{raw}'"))?;
+        let end: u16 = last
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid last port in range '{raw}'"))?;
+        if start > end {
+            bail!("invalid port range '{raw}': first port is greater than last port");
+        }
+        Ok(PortRange { start, end })
+    }
 }
 
 impl Default for PortRange {
@@ -71,10 +102,115 @@ impl Default for PortRange {
     }
 }
 
+/// Data-connection port range AWS Transfer Family uses for FTP/FTPS; the default because that is
+/// the backend this setting exists for.
+pub const DEFAULT_BACKEND_PASSIVE_PORTS: PortRange = PortRange {
+    start: 8192,
+    end: 8200,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BackendConfig {
     pub host: String,
     pub port: u16,
+    /// The range of data-connection (PASV) ports this backend serves. Its size is how many
+    /// data connections one source address can have open to this backend at once, which
+    /// `backend_source` rotation uses as a capacity. It is not enforced as a filter: a PASV
+    /// reply naming a port outside it is still honored, since the default applies to every
+    /// backend whether or not it actually uses that range.
+    #[serde(
+        default = "default_backend_passive_ports",
+        deserialize_with = "deserialize_port_range"
+    )]
+    pub passive_ports: PortRange,
+}
+
+impl Default for BackendConfig {
+    /// For tests and struct-update syntax; a real `host` always comes from configuration.
+    fn default() -> Self {
+        BackendConfig {
+            host: String::new(),
+            port: 21,
+            passive_ports: DEFAULT_BACKEND_PASSIVE_PORTS,
+        }
+    }
+}
+
+fn default_backend_passive_ports() -> PortRange {
+    DEFAULT_BACKEND_PASSIVE_PORTS
+}
+
+/// Accepts either the `"first:last"` string form or the `{start, end}` map form.
+fn deserialize_port_range<'de, D>(deserializer: D) -> std::result::Result<PortRange, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Form {
+        Text(String),
+        Map { start: u16, end: u16 },
+    }
+
+    let range = match Form::deserialize(deserializer)? {
+        Form::Text(text) => PortRange::parse_first_last(&text).map_err(serde::de::Error::custom)?,
+        Form::Map { start, end } => PortRange { start, end },
+    };
+    if range.is_empty() {
+        return Err(serde::de::Error::custom(
+            "passive_ports: first port is greater than last port",
+        ));
+    }
+    Ok(range)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendSourceMode {
+    /// The OS picks the source address for backend connections, with no cap on concurrent data
+    /// transfers (the gateway's original behavior).
+    #[default]
+    Off,
+    /// Rotate through the host's source addresses for backend connections, and cap concurrent
+    /// data transfers per source address at the backend's `passive_ports` size.
+    Rotate,
+}
+
+impl BackendSourceMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "off" => Ok(BackendSourceMode::Off),
+            "rotate" => Ok(BackendSourceMode::Rotate),
+            other => bail!("invalid backend source mode '{other}', expected 'off' or 'rotate'"),
+        }
+    }
+}
+
+/// Which local addresses the gateway uses as the source of its backend connections.
+///
+/// With `include_interfaces` set, only those interfaces are used. Otherwise every usable IPv4
+/// address on the host is, except those on built-in virtual interfaces (`lo`, `docker*`, `veth*`,
+/// ...) and on `exclude_interfaces`. Interface names accept `*` and `?` wildcards.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BackendSourceConfig {
+    pub mode: BackendSourceMode,
+    pub include_interfaces: Vec<String>,
+    pub exclude_interfaces: Vec<String>,
+    /// How often the host's interfaces are listed again, so an interface attached later (an EC2
+    /// ENI, say) is picked up without a restart.
+    pub refresh_secs: u64,
+}
+
+impl Default for BackendSourceConfig {
+    fn default() -> Self {
+        BackendSourceConfig {
+            mode: BackendSourceMode::Off,
+            include_interfaces: Vec::new(),
+            exclude_interfaces: Vec::new(),
+            refresh_secs: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -264,6 +400,20 @@ impl Config {
         if let Some(v) = env_var("GATEWAY_BACKEND_TLS_MAX_VERSION")? {
             self.backend_tls.max_version = BackendTlsMaxVersion::parse(&v)?;
         }
+        if let Some(v) = env_var("GATEWAY_BACKEND_SOURCE")? {
+            self.backend_source.mode = BackendSourceMode::parse(&v)?;
+        }
+        if let Some(v) = env_var("GATEWAY_BACKEND_SOURCE_INCLUDE")? {
+            self.backend_source.include_interfaces = parse_name_list(&v);
+        }
+        if let Some(v) = env_var("GATEWAY_BACKEND_SOURCE_EXCLUDE")? {
+            self.backend_source.exclude_interfaces = parse_name_list(&v);
+        }
+        if let Some(v) = env_var("GATEWAY_BACKEND_SOURCE_REFRESH_SECS")? {
+            self.backend_source.refresh_secs = v
+                .parse()
+                .context("invalid GATEWAY_BACKEND_SOURCE_REFRESH_SECS")?;
+        }
         if let Some(v) = env_var("GATEWAY_CONNECTION_TIMEOUT_SECS")? {
             self.timeouts.connection_timeout_secs = v
                 .parse()
@@ -323,8 +473,30 @@ impl Config {
                 bail!("backend_tls.server_name must not be empty");
             }
         }
+        if self.backend_source.mode == BackendSourceMode::Rotate {
+            if self.backend_source.refresh_secs == 0 {
+                bail!("backend_source.refresh_secs must be greater than 0");
+            }
+            let names = self
+                .backend_source
+                .include_interfaces
+                .iter()
+                .chain(&self.backend_source.exclude_interfaces);
+            if names.into_iter().any(|name| name.trim().is_empty()) {
+                bail!("backend_source interface names must not be empty");
+            }
+        }
         Ok(())
     }
+}
+
+/// Parses a comma-separated list of names, ignoring blanks (`"eth0, eth1"` -> `["eth0", "eth1"]`).
+fn parse_name_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn env_var(key: &str) -> Result<Option<String>> {
@@ -335,21 +507,31 @@ fn env_var(key: &str) -> Result<Option<String>> {
     }
 }
 
-/// Parses the "host1:port1,host2:port2" format.
+/// Parses the "host1:port1,host2:port2@first:last" format. The optional `@first:last` suffix is
+/// that backend's data-connection port range (see `BackendConfig::passive_ports`).
 fn parse_backends(raw: &str) -> Result<Vec<BackendConfig>> {
     raw.split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .map(|entry| {
-            let (host, port) = entry
-                .rsplit_once(':')
-                .with_context(|| format!("invalid backend entry '{entry}', expected host:port"))?;
+            let (address, passive_ports) = match entry.split_once('@') {
+                Some((address, ports)) => (
+                    address,
+                    PortRange::parse_first_last(ports)
+                        .with_context(|| format!("invalid backend entry '{entry}'"))?,
+                ),
+                None => (entry, DEFAULT_BACKEND_PASSIVE_PORTS),
+            };
+            let (host, port) = address.rsplit_once(':').with_context(|| {
+                format!("invalid backend entry '{entry}', expected host:port[@first:last]")
+            })?;
             let port: u16 = port
                 .parse()
                 .with_context(|| format!("invalid port in backend entry '{entry}'"))?;
             Ok(BackendConfig {
                 host: host.to_string(),
                 port,
+                passive_ports,
             })
         })
         .collect()
@@ -366,7 +548,8 @@ mod tests {
             backends,
             vec![BackendConfig {
                 host: "ftp01".to_string(),
-                port: 21
+                port: 21,
+                ..Default::default()
             }]
         );
     }
@@ -379,11 +562,13 @@ mod tests {
             vec![
                 BackendConfig {
                     host: "ftp01".to_string(),
-                    port: 21
+                    port: 21,
+                    ..Default::default()
                 },
                 BackendConfig {
                     host: "ftp02".to_string(),
-                    port: 2121
+                    port: 2121,
+                    ..Default::default()
                 },
             ]
         );
@@ -411,6 +596,7 @@ mod tests {
             backends: vec![BackendConfig {
                 host: "ftp01".to_string(),
                 port: 21,
+                ..Default::default()
             }],
             ..Config::default()
         };
@@ -426,24 +612,32 @@ mod tests {
             backends: vec![BackendConfig {
                 host: "ftp01".to_string(),
                 port: 21,
+                ..Default::default()
             }],
             ..Config::default()
         }
     }
 
     #[test]
-    fn example_config_parses_with_backend_tls_off_and_when_enabled() {
+    fn example_config_parses_as_shipped_and_with_the_optional_blocks_enabled() {
         let example = include_str!("../config.example.yaml");
         let as_shipped: Config = serde_yaml::from_str(example).unwrap();
         assert_eq!(as_shipped.backend_tls.mode, BackendTlsMode::Off);
+        assert_eq!(as_shipped.backend_source.mode, BackendSourceMode::Off);
+        assert_eq!(as_shipped.backends[0].passive_ports.len(), 9);
 
-        // Uncomment only the `backend_tls` block, not the header's env var list.
+        // Uncomment only the `backend_tls` / `backend_source` blocks, not the header's env var
+        // list.
         let enabled = [
             "backend_tls:",
             "  mode:",
             "  ca_file:",
             "  server_name:",
             "  max_version:",
+            "backend_source:",
+            "  include_interfaces:",
+            "  exclude_interfaces:",
+            "  refresh_secs:",
         ]
         .iter()
         .fold(example.to_string(), |text, line| {
@@ -456,6 +650,136 @@ mod tests {
             Some("ftp.example.com")
         );
         assert_eq!(enabled.backend_tls.max_version, BackendTlsMaxVersion::V1_3);
+        assert_eq!(enabled.backend_source.mode, BackendSourceMode::Rotate);
+        assert_eq!(enabled.backend_source.include_interfaces, ["ens5", "ens6"]);
+        assert_eq!(enabled.backend_source.exclude_interfaces, ["ens7"]);
+        assert_eq!(enabled.backend_source.refresh_secs, 30);
+    }
+
+    #[test]
+    fn backend_passive_ports_default_to_the_aws_transfer_family_range() {
+        let backends = parse_backends("ftp01:21").unwrap();
+        assert_eq!(
+            backends[0].passive_ports,
+            PortRange {
+                start: 8192,
+                end: 8200
+            }
+        );
+        assert_eq!(backends[0].passive_ports.len(), 9);
+    }
+
+    #[test]
+    fn parses_per_backend_passive_ports_from_env_syntax() {
+        let backends =
+            parse_backends("ftp01:21@8192:8200, ftp02:2121@30000:30009,ftp03:21").unwrap();
+        assert_eq!(backends[0].passive_ports.len(), 9);
+        assert_eq!(
+            backends[1].passive_ports,
+            PortRange {
+                start: 30000,
+                end: 30009
+            }
+        );
+        assert_eq!(backends[1].port, 2121);
+        assert_eq!(backends[2].passive_ports, DEFAULT_BACKEND_PASSIVE_PORTS);
+    }
+
+    #[test]
+    fn single_port_range_is_allowed() {
+        let backends = parse_backends("ftp01:21@8192:8192").unwrap();
+        assert_eq!(backends[0].passive_ports.len(), 1);
+    }
+
+    #[test]
+    fn rejects_malformed_backend_passive_ports() {
+        assert!(parse_backends("ftp01:21@8200:8192").is_err());
+        assert!(parse_backends("ftp01:21@8192").is_err());
+        assert!(parse_backends("ftp01:21@a:b").is_err());
+        assert!(parse_backends("ftp01:21@8192:70000").is_err());
+    }
+
+    #[test]
+    fn parses_backend_passive_ports_from_yaml_in_both_forms() {
+        let config: Config = serde_yaml::from_str(
+            "backends:\n  - host: a\n    port: 21\n    passive_ports: \"9000:9004\"\n  - host: b\n    port: 21\n    passive_ports: {start: 9100, end: 9102}\n  - host: c\n    port: 21\n",
+        )
+        .unwrap();
+        assert_eq!(config.backends[0].passive_ports.len(), 5);
+        assert_eq!(config.backends[1].passive_ports.len(), 3);
+        assert_eq!(
+            config.backends[2].passive_ports,
+            DEFAULT_BACKEND_PASSIVE_PORTS
+        );
+    }
+
+    #[test]
+    fn rejects_inverted_backend_passive_ports_in_yaml() {
+        assert!(
+            serde_yaml::from_str::<Config>(
+                "backends:\n  - host: a\n    port: 21\n    passive_ports: \"9004:9000\"\n"
+            )
+            .is_err()
+        );
+        assert!(
+            serde_yaml::from_str::<Config>(
+                "backends:\n  - host: a\n    port: 21\n    passive_ports: {start: 9004, end: 9000}\n"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn backend_source_defaults_to_off() {
+        let source = Config::default().backend_source;
+        assert_eq!(source.mode, BackendSourceMode::Off);
+        assert!(source.include_interfaces.is_empty());
+        assert!(source.exclude_interfaces.is_empty());
+        assert_eq!(source.refresh_secs, 30);
+    }
+
+    #[test]
+    fn parses_backend_source_from_yaml() {
+        let config: Config = serde_yaml::from_str(
+            "backend_source:\n  mode: rotate\n  include_interfaces: [eth0, \"ens*\"]\n  exclude_interfaces: [eth9]\n  refresh_secs: 10\n",
+        )
+        .unwrap();
+        assert_eq!(config.backend_source.mode, BackendSourceMode::Rotate);
+        assert_eq!(config.backend_source.include_interfaces, ["eth0", "ens*"]);
+        assert_eq!(config.backend_source.exclude_interfaces, ["eth9"]);
+        assert_eq!(config.backend_source.refresh_secs, 10);
+    }
+
+    #[test]
+    fn parses_backend_source_mode_and_name_lists() {
+        assert_eq!(
+            BackendSourceMode::parse("Rotate").unwrap(),
+            BackendSourceMode::Rotate
+        );
+        assert_eq!(
+            BackendSourceMode::parse("off").unwrap(),
+            BackendSourceMode::Off
+        );
+        assert!(BackendSourceMode::parse("round-robin").is_err());
+        assert_eq!(parse_name_list(" eth0, ,ens*,"), ["eth0", "ens*"]);
+        assert!(parse_name_list("").is_empty());
+    }
+
+    #[test]
+    fn validate_checks_backend_source_only_when_rotating() {
+        let mut config = config_with_backend();
+        config.backend_source.refresh_secs = 0;
+        config.backend_source.include_interfaces = vec![" ".to_string()];
+        assert!(config.validate().is_ok());
+
+        config.backend_source.mode = BackendSourceMode::Rotate;
+        assert!(config.validate().is_err());
+
+        config.backend_source.refresh_secs = 30;
+        assert!(config.validate().is_err(), "blank interface name");
+
+        config.backend_source.include_interfaces = vec!["eth0".to_string()];
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -512,6 +836,7 @@ mod tests {
             backends: vec![BackendConfig {
                 host: "ftp01".to_string(),
                 port: 21,
+                ..Default::default()
             }],
             ..Config::default()
         };

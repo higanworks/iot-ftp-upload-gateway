@@ -21,6 +21,7 @@ async fn stor_with_cr_in_filename_is_rejected_without_reaching_backend() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -76,6 +77,7 @@ async fn command_with_embedded_cr_does_not_smuggle_a_second_command() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -123,6 +125,7 @@ async fn stor_with_backslash_in_filename_uploads_normally() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -166,6 +169,7 @@ async fn stor_with_nul_byte_in_filename_uploads_without_crashing() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -207,6 +211,7 @@ async fn oversized_command_line_is_rejected() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,

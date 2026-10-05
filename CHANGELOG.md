@@ -21,6 +21,20 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
   session for backends that require session reuse. Fails closed: a backend that can't complete
   the negotiation ends the session with `421`, never falling back to plain FTP. Off by default;
   existing deployments are unaffected.
+- Optional source-address rotation for backend connections, for backends that serve data
+  connections from a tiny port range (AWS Transfer Family: 8192–8200): with
+  `backend_source.mode: rotate` (`GATEWAY_BACKEND_SOURCE=rotate`) the gateway connects to
+  backends from each local IPv4 address in turn instead of the one the OS picks. A session keeps
+  one source for its control and data connections; per backend, new sessions move on to the
+  next source after as many data connections as the backend's data port range holds, and at most
+  that many transfers run at once per source address (extra uploads wait, then get `425`).
+  Sources are chosen with `backend_source.include_interfaces` / `exclude_interfaces` (wildcards
+  allowed; by default every address except loopback, link-local and virtual interfaces),
+  re-listed every `refresh_secs`, and a source that fails to connect is skipped for 60 seconds.
+  Off by default; existing deployments are unaffected.
+- A per-backend data port range, `backends[].passive_ports` (`GATEWAY_BACKENDS` entries accept
+  `host:port@first:last`), default `8192:8200`. Only its size is used, and only with source
+  rotation on.
 
 ## [2026.9.5] - 2026-09-16
 

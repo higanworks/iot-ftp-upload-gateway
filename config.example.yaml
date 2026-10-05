@@ -8,13 +8,18 @@
 #   GATEWAY_PASSIVE_ADDRESS
 #   GATEWAY_PASSIVE_PORT_RANGE_START
 #   GATEWAY_PASSIVE_PORT_RANGE_END
-#   GATEWAY_BACKENDS                 (example: "ftp01:21,ftp02:21")
+#   GATEWAY_BACKENDS                 (example: "ftp01:21,ftp02:21@8192:8200"; `@first:last` is that
+#                                     backend's data port range, default 8192:8200)
 #   GATEWAY_CONNECTION_TIMEOUT_SECS
 #   GATEWAY_IDLE_TIMEOUT_SECS
 #   GATEWAY_BACKEND_TLS              ("off" or "explicit")
 #   GATEWAY_BACKEND_TLS_CA_FILE
 #   GATEWAY_BACKEND_TLS_SERVER_NAME
 #   GATEWAY_BACKEND_TLS_MAX_VERSION  ("1.3" or "1.2")
+#   GATEWAY_BACKEND_SOURCE           ("off" or "rotate")
+#   GATEWAY_BACKEND_SOURCE_INCLUDE   (comma-separated interface names, `*` and `?` wildcards)
+#   GATEWAY_BACKEND_SOURCE_EXCLUDE   (comma-separated interface names, `*` and `?` wildcards)
+#   GATEWAY_BACKEND_SOURCE_REFRESH_SECS
 
 listen:
   address: 0.0.0.0
@@ -29,6 +34,10 @@ passive:
 backends:
   - host: ftp01
     port: 21
+    # Data-connection (PASV) ports this backend serves; the default is AWS Transfer Family's.
+    # Only its size matters, and only with `backend_source` rotation (below): it is how many
+    # data transfers one source address may have open to this backend at once.
+    passive_ports: "8192:8200"
   - host: ftp02
     port: 21
 
@@ -41,6 +50,20 @@ backends:
 #  ca_file: /etc/gateway/ca.pem    # PEM CA bundle; omit to trust the bundled public CA roots
 #  server_name: ftp.example.com    # SNI / certificate name; omit to use each backend's `host`
 #  max_version: "1.3"              # "1.2" pins TLS 1.2 (see README, "Backend FTPS")
+
+# Optional: rotate the local (source) address used toward the backends, for backends that serve
+# data connections from a small port range (AWS Transfer Family: 8192-8200) and so limit how many
+# transfers one source address can run at once. Each address on this host is a separate source.
+# A session keeps one source for its control and data connections; the current source moves on
+# after as many data connections as the backend's `passive_ports` holds. Needs several addresses
+# on the host and routing that sends each one out the right interface (see README, "Backend
+# source rotation"). Off by default.
+#backend_source:
+#  mode: rotate                    # "off" (default) or "rotate"
+#  include_interfaces: [ens5, ens6]   # only these interfaces (`*` and `?` wildcards); omit to use every
+#                                  # interface except loopback, link-local and virtual ones
+#  exclude_interfaces: [ens7]      # never these, whether or not included above
+#  refresh_secs: 30                # how often interfaces are listed again
 
 timeouts:
   connection_timeout_secs: 10

@@ -26,6 +26,7 @@ async fn spawn_session(
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -50,6 +51,7 @@ async fn spawn_session(
             port_manager,
             iot_ftp_upload_gateway::metrics::Metrics::new(),
             DnsCache::new(),
+            None,
             None,
         )
         .await

@@ -127,7 +127,7 @@ config file and overridden per-environment via env vars.
 | Address advertised in PASV replies | `passive.address` | `GATEWAY_PASSIVE_ADDRESS` | `0.0.0.0` |
 | PASV port range start | `passive.port_range.start` | `GATEWAY_PASSIVE_PORT_RANGE_START` | `10000` |
 | PASV port range end | `passive.port_range.end` | `GATEWAY_PASSIVE_PORT_RANGE_END` | `20000` |
-| Backend servers | `backends` | `GATEWAY_BACKENDS` (`host:port,host:port`) | *(required — startup fails if empty)* |
+| Backend servers | `backends` | `GATEWAY_BACKENDS` (`host:port[@first:last],host:port`) | *(required — startup fails if empty)* |
 | Backend connect timeout (secs) | `timeouts.connection_timeout_secs` | `GATEWAY_CONNECTION_TIMEOUT_SECS` | `10` |
 | Control connection idle timeout (secs) | `timeouts.idle_timeout_secs` | `GATEWAY_IDLE_TIMEOUT_SECS` | `300` |
 | Backend command response timeout (secs) | `timeouts.command_timeout_secs` | `GATEWAY_COMMAND_TIMEOUT_SECS` | `30` |
@@ -140,6 +140,11 @@ config file and overridden per-environment via env vars.
 | Backend TLS CA bundle (PEM) | `backend_tls.ca_file` | `GATEWAY_BACKEND_TLS_CA_FILE` | *(unset — bundled public roots)* |
 | Backend TLS server name | `backend_tls.server_name` | `GATEWAY_BACKEND_TLS_SERVER_NAME` | *(unset — each backend's `host`)* |
 | Backend TLS max version | `backend_tls.max_version` | `GATEWAY_BACKEND_TLS_MAX_VERSION` (`1.3` / `1.2`) | `1.3` |
+| Backend data port range (per backend) | `backends[].passive_ports` | `@first:last` after a `GATEWAY_BACKENDS` entry | `8192:8200` |
+| Backend source rotation | `backend_source.mode` | `GATEWAY_BACKEND_SOURCE` (`off` / `rotate`) | `off` |
+| Source interfaces to use | `backend_source.include_interfaces` | `GATEWAY_BACKEND_SOURCE_INCLUDE` (comma-separated) | *(unset — all usable)* |
+| Source interfaces to skip | `backend_source.exclude_interfaces` | `GATEWAY_BACKEND_SOURCE_EXCLUDE` (comma-separated) | *(unset)* |
+| Interface re-listing interval (secs) | `backend_source.refresh_secs` | `GATEWAY_BACKEND_SOURCE_REFRESH_SECS` | `30` |
 
 A control line (a client command or a backend reply) that exceeds `max_command_line_bytes`
 without a terminating newline ends the session — a client hits `500 Command line too long`; a
@@ -201,6 +206,82 @@ of these commands (a client-sent `AUTH` is still rejected with `502`).
 Because the gateway acts as the TLS client on both connections, it trusts the backend's
 certificate exactly as strictly as any other FTPS client would; it does not terminate TLS for
 devices.
+
+## Backend source rotation
+
+Some backends serve data connections from a very small port range — AWS Transfer Family uses
+8192–8200, nine ports — which caps how many uploads one client IP can have in flight. With
+`backend_source.mode: rotate` (`GATEWAY_BACKEND_SOURCE=rotate`) the gateway connects to backends
+from several local addresses instead of the one the OS would pick, multiplying that capacity by
+the number of addresses. It is off by default; with it off, nothing here applies.
+
+- **Sources.** Every IPv4 address on the host is a separate source — an interface with several
+  addresses (EC2 secondary private IPs) counts once per address. By default all are used except
+  loopback, link-local, and addresses on virtual interfaces (`lo`, `docker*`, `br-*`, `veth*`,
+  `virbr*`, `cni*`, `flannel*`, `cali*`, `tun*`, `tap*`, `tailscale*`, `wg*`). Set
+  `include_interfaces` to use only the interfaces you name (naming a virtual one is then
+  honored), and `exclude_interfaces` to drop some; both accept `*` and `?` wildcards.
+  Interfaces are listed again every `refresh_secs`, so one attached later (an EC2 ENI) is picked
+  up without a restart. Startup fails if no usable source is found.
+- **A session keeps one source.** Its control connection and every data connection come from the
+  same address — backends tie a data connection to its control connection's client IP.
+- **When the source changes.** Per backend, the gateway counts data connections (uploads) as they
+  start, and after as many as that backend's `passive_ports` holds (9 for `8192:8200`) it moves
+  its "current" source to the next address. *New* sessions are handed the current source;
+  sessions already running stay where they are.
+- **Capacity cap.** At most that many data transfers run at once from one source address to one
+  backend. A further upload waits up to `timeouts.connection_timeout_secs` for a slot, then the
+  client gets `425`. Without rotation there is no such cap.
+- **Failures.** If connecting from a source fails because of the source (the address isn't
+  usable, the network or host is unreachable, or the attempt times out), the gateway tries the
+  next one for that session and leaves the failed one out of the rotation for 60 seconds. A
+  refused connection is not held against the source — that is the backend, and every source would
+  hit it. If no source can connect, the client gets `421`. The OS does not report whether an
+  interface is up, so a down interface is found out this way.
+- **`passive_ports` is only a size.** It sets each backend's capacity per source address (default
+  `8192:8200`, i.e. 9). The port in a backend's PASV reply is not checked against it (one WARN per
+  session is logged if it falls outside, with rotation on). Because the default applies to every
+  backend, set `passive_ports` explicitly for any backend that isn't AWS Transfer Family once
+  rotation is on, or it will be capped at 9 transfers per source address too.
+
+```yaml
+backends:
+  - host: s-0123456789abcdef0.server.transfer.us-east-1.amazonaws.com
+    port: 21
+    passive_ports: "8192:8200"   # AWS Transfer Family's data ports (the default)
+backend_source:
+  mode: rotate
+  include_interfaces: [ens5, ens6]
+```
+
+**What the host must provide** (not something the gateway can set up):
+
+- **Several addresses reachable from outside the host**, e.g. one or more extra ENIs or secondary
+  private IPs on the EC2 instance, with `network_mode: host` so the container sees them.
+- **Source-based routing for any additional ENI.** A packet sent from a secondary ENI's address
+  but routed out the primary ENI is dropped (AWS checks that a packet's source address belongs to
+  the ENI it leaves through). Typically, per extra ENI (here `ens6`, address `10.0.2.20`, subnet
+  gateway `10.0.2.1`):
+
+  ```sh
+  ip route add default via 10.0.2.1 dev ens6 table 100
+  ip rule add from 10.0.2.20/32 table 100
+  ```
+
+  Secondary IPs on the *same* ENI as the primary address normally need no extra routing.
+  A source without working routing is not fatal — the gateway skips it as described above — but
+  it wastes a connect attempt (up to `connection_timeout_secs`) on each session that tries it.
+- **No NAT or load balancer between the gateway and the backend.** The backend must see each
+  source address as the client IP; behind a NAT every source looks the same and the extra
+  capacity is lost. (AWS notes Transfer Family cannot recognize the client IP behind an NLB or
+  NAT.)
+
+Check the interfaces the gateway chose in its startup log (`backend source address rotation
+enabled`, listing the addresses). Each session's log lines carry a `source_ip` field, and a
+`WARN` is logged for every failed connection from a source.
+
+Whether Transfer Family really limits data ports per client IP, and so whether extra source
+addresses raise your concurrency, should be verified against your own endpoint.
 
 ## Docker
 

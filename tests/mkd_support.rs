@@ -23,6 +23,7 @@ async fn mkd_is_forwarded_to_backend() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -66,6 +67,7 @@ async fn ftp_create_dirs_style_upload_succeeds() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -142,6 +144,7 @@ async fn unsupported_command_is_rejected_without_reaching_backend() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,

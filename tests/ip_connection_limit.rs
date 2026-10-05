@@ -33,8 +33,10 @@ async fn extra_connection_beyond_the_per_ip_limit_is_rejected() {
         backends: vec![BackendConfig {
             host: backend.addr.ip().to_string(),
             port: backend.addr.port(),
+            ..Default::default()
         }],
         backend_tls: Default::default(),
+        backend_source: Default::default(),
         timeouts: TimeoutConfig::default(),
         limits: LimitsConfig {
             max_connections_per_ip: 2,

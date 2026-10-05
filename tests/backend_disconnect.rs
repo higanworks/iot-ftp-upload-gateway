@@ -18,6 +18,7 @@ async fn backend_refuses_connection_returns_421() {
     let backend_config = BackendConfig {
         host: unreachable.ip().to_string(),
         port: unreachable.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -51,6 +52,7 @@ async fn backend_closes_before_banner_returns_421() {
     let backend_config = BackendConfig {
         host: backend_addr.ip().to_string(),
         port: backend_addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -84,6 +86,7 @@ async fn backend_disconnect_before_data_connection_returns_425_and_releases_port
     let backend_config = BackendConfig {
         host: backend_addr.ip().to_string(),
         port: backend_addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -146,6 +149,7 @@ async fn backend_disconnect_during_transfer_returns_426_and_releases_port() {
     let backend_config = BackendConfig {
         host: backend_addr.ip().to_string(),
         port: backend_addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
