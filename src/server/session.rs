@@ -1,5 +1,5 @@
 use std::io;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,6 +8,7 @@ use tokio::net::TcpStream;
 
 use crate::backend;
 use crate::backend::dns_cache::DnsCache;
+use crate::backend::rotator::{DataSlot, SourceRotator};
 use crate::backend::tls::{self, BackendStream, BackendTlsConnector};
 use crate::config::{BackendConfig, LimitsConfig, PassiveConfig, TimeoutConfig};
 use crate::metrics::Metrics;
@@ -22,6 +23,10 @@ use crate::protocol::reply;
 struct DataChannel {
     client_data: TcpStream,
     backend_data: TcpStream,
+    /// Held until the transfer is over (dropped with the channel's scope), so a source address's
+    /// data-transfer capacity stays claimed for exactly as long as the transfer runs. `None`
+    /// when source rotation is off.
+    _data_slot: Option<DataSlot>,
 }
 
 /// Treats an I/O failure on the *client* connection as a normal disconnect (PROJECT_ADDITION.ja.md
@@ -108,12 +113,13 @@ where
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "session",
-    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager, metrics, dns_cache, backend_tls),
+    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager, metrics, dns_cache, backend_tls, source_rotator),
     fields(
         session_id = session_id,
         client_ip = %peer_addr.ip(),
         backend_host = %backend_config.host,
-        backend_port = backend_config.port
+        backend_port = backend_config.port,
+        source_ip = tracing::field::Empty
     )
 )]
 pub async fn handle(
@@ -128,6 +134,7 @@ pub async fn handle(
     metrics: Arc<Metrics>,
     dns_cache: DnsCache,
     backend_tls: Option<BackendTlsConnector>,
+    source_rotator: Option<SourceRotator>,
 ) -> anyhow::Result<()> {
     tracing::info!("session started");
     let _session_guard = metrics.session_started();
@@ -144,16 +151,55 @@ pub async fn handle(
     let data_idle_timeout = Duration::from_secs(timeouts.data_idle_timeout_secs);
     let max_command_line_bytes = limits.max_command_line_bytes;
 
-    let backend_stream =
-        match backend::connection::connect(&backend_config, connection_timeout, &dns_cache).await {
-            Ok(stream) => stream,
-            Err(err) => {
+    let backend_key = format!("{}:{}", backend_config.host, backend_config.port);
+    let connected = match &source_rotator {
+        None => backend::connection::connect(&backend_config, connection_timeout, &dns_cache, None)
+            .await
+            .map(|stream| (stream, None))
+            .map_err(|err| {
                 tracing::warn!(error = %err, "failed to connect to backend");
-                let mut client = client;
-                let _ = client.write_all(b"421 Service not available\r\n").await;
-                return Ok(());
+            }),
+        Some(rotator) => {
+            // The session takes the first source address that connects and keeps it: its data
+            // connections must come from the same address as this control connection.
+            let mut connected = Err(());
+            for source in rotator.candidates(&backend_key) {
+                match backend::connection::connect(
+                    &backend_config,
+                    connection_timeout,
+                    &dns_cache,
+                    Some(source),
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        connected = Ok((stream, Some(source)));
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!(source_ip = %source, error = %err, "failed to connect to backend from this source address");
+                        rotator.report_connect_failure(source, &err);
+                    }
+                }
             }
-        };
+            connected
+        }
+    };
+    let (backend_stream, source_ip): (TcpStream, Option<Ipv4Addr>) = match connected {
+        Ok(connected) => connected,
+        Err(()) => {
+            let mut client = client;
+            let _ = client.write_all(b"421 Service not available\r\n").await;
+            return Ok(());
+        }
+    };
+    if let Some(source_ip) = source_ip {
+        tracing::Span::current().record("source_ip", tracing::field::display(source_ip));
+    }
+    // Only set when rotation is on: the source address this session uses toward the backend
+    // plus the slot accounting that goes with it.
+    let rotation = source_rotator.zip(source_ip);
+    let mut warned_port_outside_range = false;
 
     let mut client_conn = BufReader::new(client);
     let mut backend_conn = BufReader::new(BackendStream::Plain(backend_stream));
@@ -317,11 +363,57 @@ pub async fn handle(
                     let channel = match tokio::time::timeout(connection_timeout, guard.listener().accept()).await {
                         Ok(Ok((client_data, data_peer))) => {
                             tracing::info!(%data_peer, port, "data connection accepted");
-                            match relay::open_backend_data_connection(&mut backend_conn).await {
-                                Ok(backend_data) => Some(DataChannel { client_data, backend_data }),
-                                Err(err) => {
-                                    tracing::warn!(error = %err, "failed to open backend data connection");
-                                    None
+                            // With source rotation, claim this transfer's slot on the session's
+                            // source address before asking the backend for a data port: the
+                            // backend's data ports are the scarce thing being rationed.
+                            let data_slot = match &rotation {
+                                Some((rotator, source)) => {
+                                    let slot = rotator
+                                        .acquire_data_slot(
+                                            &backend_key,
+                                            backend_config.passive_ports.len(),
+                                            *source,
+                                            connection_timeout,
+                                        )
+                                        .await;
+                                    if slot.is_none() {
+                                        tracing::warn!(source_ip = %source, "no data transfer slot free on this source address (timed out)");
+                                    }
+                                    slot.map(Some)
+                                }
+                                None => Some(None),
+                            };
+                            match data_slot {
+                                None => None,
+                                Some(data_slot) => {
+                                    let local_ip = rotation.as_ref().map(|(_, source)| *source);
+                                    match relay::open_backend_data_connection(&mut backend_conn, local_ip).await {
+                                        Ok(backend_data) => {
+                                            if rotation.is_some()
+                                                && !warned_port_outside_range
+                                                && let Ok(addr) = backend_data.peer_addr()
+                                                && !(backend_config.passive_ports.start..=backend_config.passive_ports.end).contains(&addr.port())
+                                            {
+                                                warned_port_outside_range = true;
+                                                tracing::warn!(
+                                                    backend_data_port = addr.port(),
+                                                    configured_start = backend_config.passive_ports.start,
+                                                    configured_end = backend_config.passive_ports.end,
+                                                    "backend data port is outside its configured passive_ports range; transfer capacity per source address may be mis-sized"
+                                                );
+                                            }
+                                            Some(DataChannel { client_data, backend_data, _data_slot: data_slot })
+                                        }
+                                        Err(err) => {
+                                            tracing::warn!(error = %err, "failed to open backend data connection");
+                                            if let Some((rotator, source)) = &rotation
+                                                && let Some(io_err) = err.root_cause().downcast_ref::<io::Error>()
+                                            {
+                                                rotator.report_connect_failure(*source, io_err);
+                                            }
+                                            None
+                                        }
+                                    }
                                 }
                             }
                         }

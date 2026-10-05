@@ -18,6 +18,7 @@ async fn second_session_gets_425_while_pool_is_exhausted_then_succeeds_after_rel
     let backend_config = || iot_ftp_upload_gateway::config::BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,

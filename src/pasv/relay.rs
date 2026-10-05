@@ -1,21 +1,27 @@
 use std::io;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use crate::backend::connection::connect_from;
 use crate::backend::tls::BackendStream;
 use crate::protocol::reply::parse_pasv_reply;
 
 /// Asks the backend to open a passive data connection and connects to the address/port
 /// it returns. The Gateway itself acts as a PASV client toward the backend here.
 ///
+/// With `local_ip`, the connection is made from that local address -- the same one the control
+/// connection uses, since backends tie a data connection to its control connection's client IP.
+///
 /// This only opens the TCP connection. With backend FTPS the TLS handshake on a data connection
 /// cannot happen here: servers start it only once the transfer command (`STOR`) has been
 /// received, so the caller performs it after forwarding `STOR` and getting the `150` reply.
 pub async fn open_backend_data_connection(
     backend_control: &mut BufReader<BackendStream>,
+    local_ip: Option<Ipv4Addr>,
 ) -> anyhow::Result<TcpStream> {
     backend_control.write_all(b"PASV\r\n").await?;
 
@@ -28,7 +34,7 @@ pub async fn open_backend_data_connection(
     let (ip, port) = parse_pasv_reply(&line)
         .ok_or_else(|| anyhow!("backend returned an unparsable PASV reply: {line:?}"))?;
 
-    TcpStream::connect((ip, port))
+    connect_from(SocketAddr::from((ip, port)), local_ip)
         .await
         .context("failed to connect to backend data port")
 }
@@ -149,10 +155,57 @@ mod tests {
         let control_stream = TcpStream::connect(control_addr).await.unwrap();
         let mut backend_control = BufReader::new(BackendStream::Plain(control_stream));
 
-        let data_stream = open_backend_data_connection(&mut backend_control)
+        let data_stream = open_backend_data_connection(&mut backend_control, None)
             .await
             .unwrap();
         assert_eq!(data_stream.peer_addr().unwrap().port(), data_port);
+    }
+
+    /// A backend whose PASV reply points at a data listener; returns the control address and the
+    /// data listener's address of that backend.
+    async fn spawn_pasv_backend() -> (std::net::SocketAddr, TcpListener) {
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let control_addr = control_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = control_listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            let reply = pasv_reply(Ipv4Addr::LOCALHOST, data_port);
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            // Keep the control connection open until the test is done with it.
+            let _ = stream.read_line(&mut line).await;
+        });
+        (control_addr, data_listener)
+    }
+
+    #[tokio::test]
+    async fn data_connection_is_made_from_the_given_local_ip() {
+        let (control_addr, data_listener) = spawn_pasv_backend().await;
+        let control = TcpStream::connect(control_addr).await.unwrap();
+        let mut backend_control = BufReader::new(BackendStream::Plain(control));
+
+        let data = open_backend_data_connection(&mut backend_control, Some(Ipv4Addr::LOCALHOST))
+            .await
+            .unwrap();
+        let (_accepted, peer) = data_listener.accept().await.unwrap();
+        assert_eq!(peer.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(data.local_addr().unwrap().ip(), peer.ip());
+    }
+
+    #[tokio::test]
+    async fn data_connection_fails_when_the_local_ip_is_not_this_hosts() {
+        let (control_addr, _data_listener) = spawn_pasv_backend().await;
+        let control = TcpStream::connect(control_addr).await.unwrap();
+        let mut backend_control = BufReader::new(BackendStream::Plain(control));
+
+        // TEST-NET-3 (RFC 5737): never assigned to a real interface.
+        let result =
+            open_backend_data_connection(&mut backend_control, Some(Ipv4Addr::new(203, 0, 113, 9)))
+                .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

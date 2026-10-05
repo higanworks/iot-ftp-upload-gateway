@@ -105,6 +105,7 @@ async fn spawn_session(backend: SocketAddr, connector: BackendTlsConnector) -> S
     let backend_config = BackendConfig {
         host: backend.ip().to_string(),
         port: backend.port(),
+        ..Default::default()
     };
     let port_range = PortRange {
         start: 19850,
@@ -131,6 +132,7 @@ async fn spawn_session(backend: SocketAddr, connector: BackendTlsConnector) -> S
             iot_ftp_upload_gateway::metrics::Metrics::new(),
             DnsCache::new(),
             Some(connector),
+            None,
         )
         .await
         .unwrap();

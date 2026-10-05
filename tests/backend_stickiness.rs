@@ -40,9 +40,11 @@ async fn control_and_data_stay_on_the_backend_assigned_at_session_start() {
             .map(|b| BackendConfig {
                 host: b.addr.ip().to_string(),
                 port: b.addr.port(),
+                ..Default::default()
             })
             .collect(),
         backend_tls: Default::default(),
+        backend_source: Default::default(),
         timeouts: TimeoutConfig::default(),
         limits: LimitsConfig::default(),
         metrics: Default::default(),

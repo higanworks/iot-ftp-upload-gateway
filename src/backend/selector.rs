@@ -41,6 +41,7 @@ mod tests {
         BackendConfig {
             host: host.to_string(),
             port: 21,
+            ..Default::default()
         }
     }
 

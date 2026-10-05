@@ -7,9 +7,11 @@ use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
 use crate::backend::dns_cache::DnsCache;
+use crate::backend::rotator::SourceRotator;
 use crate::backend::selector::BackendSelector;
+use crate::backend::source::SystemInterfaces;
 use crate::backend::tls::BackendTlsConnector;
-use crate::config::{BackendTlsMode, Config};
+use crate::config::{BackendSourceMode, BackendTlsMode, Config};
 use crate::metrics::Metrics;
 use crate::pasv::port_manager::PortManager;
 use crate::shutdown;
@@ -41,6 +43,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let backend_tls = match config.backend_tls.mode {
         BackendTlsMode::Off => None,
         BackendTlsMode::Explicit => Some(BackendTlsConnector::new(&config.backend_tls)?),
+    };
+    // Fails startup if no source address is usable, so a wrong include/exclude is caught here
+    // rather than as refused sessions later.
+    let source_rotator = match config.backend_source.mode {
+        BackendSourceMode::Off => None,
+        BackendSourceMode::Rotate => Some(SourceRotator::start(
+            Arc::new(SystemInterfaces),
+            &config.backend_source,
+        )?),
     };
     let metrics = Metrics::new();
     let mut sessions = JoinSet::new();
@@ -96,6 +107,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 let metrics = Arc::clone(&metrics);
                 let dns_cache = dns_cache.clone();
                 let backend_tls = backend_tls.clone();
+                let source_rotator = source_rotator.clone();
 
                 sessions.spawn(async move {
                     // Held for the whole session so its slot in `ip_limiter` is released
@@ -113,6 +125,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         metrics,
                         dns_cache,
                         backend_tls,
+                        source_rotator,
                     )
                     .await
                     {

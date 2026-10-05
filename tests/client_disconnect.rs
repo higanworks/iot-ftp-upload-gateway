@@ -20,6 +20,7 @@ async fn client_disconnect_after_pasv_releases_port() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -72,6 +73,7 @@ async fn client_disconnect_mid_upload_completes_without_hanging() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
@@ -130,6 +132,7 @@ async fn next_session_succeeds_after_a_prior_disconnect() {
     let backend_config = BackendConfig {
         host: backend.addr.ip().to_string(),
         port: backend.addr.port(),
+        ..Default::default()
     };
     let passive_config = PassiveConfig {
         address: Ipv4Addr::LOCALHOST,
