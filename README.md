@@ -39,7 +39,38 @@ flowchart LR
     device1 -- "plain FTP<br/>control + PASV data" --> gw
     device2 -- "plain FTP" --> gw
     deviceN -- "plain FTP" --> gw
-    gw -- "STOR only, round-robin<br/>plain FTP, or Explicit FTPS (TLS)<br/>with backend_tls" --> b1
+    gw -- "STOR only, round-robin<br/>plain FTP" --> b1
+    gw -.-> b2
+    gw -.-> b3
+```
+
+With [`backend_tls`](#backend-ftps) enabled, the gateway-to-backend leg is Explicit FTPS
+instead — both the control and the data connections are encrypted — while devices still speak
+plain FTP. The hop that crosses the network you don't control can be secured without touching
+the devices:
+
+```mermaid
+flowchart LR
+    subgraph internet["Internet"]
+        device1["Legacy IoT device"]
+        device2["Legacy IoT device"]
+        deviceN["..."]
+    end
+
+    subgraph dmz["Public / DMZ — only thing exposed"]
+        gw["iot-ftp-upload-gateway<br/>write-only, allow-listed FTP commands<br/>backend_tls: explicit"]
+    end
+
+    subgraph private["Private network / VPC"]
+        b1["Backend FTPS #1"]
+        b2["Backend FTPS #2"]
+        b3["Backend FTPS #3"]
+    end
+
+    device1 -- "plain FTP<br/>control + PASV data" --> gw
+    device2 -- "plain FTP" --> gw
+    deviceN -- "plain FTP" --> gw
+    gw -- "STOR only, round-robin<br/>Explicit FTPS (TLS)<br/>control + data" --> b1
     gw -.-> b2
     gw -.-> b3
 ```
@@ -49,12 +80,8 @@ backend (picked round-robin when the session starts), so a client's upload is ne
 across backends. See [Operational notes](#operational-notes) for how this behaves across
 multiple gateway instances.
 
-Devices always speak plain FTP to the gateway. The gateway-to-backend leg is plain FTP by
-default, or Explicit FTPS (control and data connections both encrypted) when
-[`backend_tls`](#backend-ftps) is enabled — so the hop that crosses the network you don't
-control can be encrypted without touching the devices. For backends that serve data connections
-from a very small port range, such as AWS Transfer Family, the gateway can also spread its
-backend connections over several local addresses
+For backends that serve data connections from a very small port range, such as AWS Transfer
+Family, the gateway can also spread its backend connections over several local addresses
 ([`backend_source`](#backend-source-rotation)); that setup is described in
 [Using AWS Transfer Family as the backend](#using-aws-transfer-family-as-the-backend).
 
