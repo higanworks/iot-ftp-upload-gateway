@@ -5,6 +5,10 @@ and publishes the values to CloudWatch as custom metrics.
 One-shot by design: run it periodically from cron or a systemd timer rather than as a
 long-running daemon (see samples/README.md for a timer unit example).
 
+Labels on a scraped series (the per-source-address metrics shown when the gateway's source
+rotation is on carry `backend` and `source`) become CloudWatch dimensions on that metric, next to
+any `--dimension` given on the command line.
+
 Requires `cloudwatch:PutMetricData` IAM permission for whatever credentials boto3 resolves
 (instance profile, environment variables, ~/.aws/credentials, ...).
 """
@@ -12,8 +16,9 @@ Requires `cloudwatch:PutMetricData` IAM permission for whatever credentials boto
 from __future__ import annotations
 
 import argparse
+import math
 import sys
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import boto3
 import requests
@@ -25,32 +30,128 @@ METRIC_UNITS = {
     "ftp_gateway_sessions_active": "Count",
     "ftp_gateway_uploads_active": "Count",
     "ftp_gateway_pasv_ports_active": "Count",
+    "ftp_gateway_pasv_ports_capacity": "Count",
     "ftp_gateway_sessions_total": "Count",
     "ftp_gateway_upload_bytes_total": "Bytes",
     "ftp_gateway_connections_rejected_total": "Count",
+    "ftp_gateway_uploads_started_total": "Count",
+    "ftp_gateway_uploads_completed_total": "Count",
+    "ftp_gateway_uploads_failed_total": "Count",
+    "ftp_gateway_backend_pasv_failures_total": "Count",
+    "ftp_gateway_backend_data_connection_failures_total": "Count",
+    "ftp_gateway_data_connections_rejected_total": "Count",
+    "ftp_gateway_backend_timeouts_total": "Count",
+    "ftp_gateway_session_idle_timeouts_total": "Count",
+    # Only present when the gateway's backend source rotation is on; labeled by source (and,
+    # except for `unhealthy`, by backend).
+    "ftp_gateway_backend_source_unhealthy": "Count",
+    "ftp_gateway_backend_source_transfers_active": "Count",
+    "ftp_gateway_backend_source_transfers_capacity": "Count",
+    "ftp_gateway_backend_source_transfers_total": "Count",
+    "ftp_gateway_backend_source_slot_timeouts_total": "Count",
 }
 
+# CloudWatch accepts at most this many data points in one PutMetricData call.
+MAX_METRICS_PER_CALL = 1000
 
-def parse_prometheus_text(text: str) -> dict[str, float]:
-    """Parses the small subset of the Prometheus text exposition format this gateway emits:
-    one `metric_name value` pair per line, with `#` comment lines (HELP/TYPE) ignored. Not a
-    general-purpose Prometheus parser -- none of this gateway's metrics carry labels, so
-    label syntax isn't handled.
+
+class Sample(NamedTuple):
+    """One scraped series: a metric name, its labels (empty for most of the gateway's
+    metrics), and its value."""
+
+    name: str
+    labels: dict[str, str]
+    value: float
+
+
+def parse_prometheus_text(text: str) -> list[Sample]:
+    """Parses the subset of the Prometheus text exposition format this gateway emits: lines of
+    `name value` or `name{label="value",...} value`, with `#` comment lines (HELP/TYPE) ignored.
+    Label values may contain the three escapes the format defines (backslash-backslash,
+    backslash-quote, backslash-n). Not a general-purpose Prometheus
+    parser (no histograms, no exemplars), but lines it does not understand are skipped rather than
+    sent to CloudWatch -- PutMetricData rejects the whole batch if one data point is invalid.
+    Values that are not finite (NaN, +Inf) are skipped for the same reason.
     """
-    metrics: dict[str, float] = {}
+    samples: list[Sample] = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        sample = parse_sample_line(line)
+        if sample is not None:
+            samples.append(sample)
+    return samples
+
+
+def parse_sample_line(line: str) -> Sample | None:
+    brace = line.find("{")
+    first_space = line.find(" ")
+    if brace == -1 or (first_space != -1 and first_space < brace):
+        # No labels: `name value [timestamp]`.
         parts = line.split()
-        if len(parts) != 2:
-            continue
-        name, raw_value = parts
-        try:
-            metrics[name] = float(raw_value)
-        except ValueError:
-            continue
-    return metrics
+        if len(parts) not in (2, 3):
+            return None
+        name, labels, raw_value = parts[0], {}, parts[1]
+    else:
+        name = line[:brace]
+        parsed = parse_labels(line, brace + 1)
+        if parsed is None:
+            return None
+        labels, end = parsed
+        parts = line[end:].split()
+        if len(parts) not in (1, 2):
+            return None
+        raw_value = parts[0]
+    try:
+        value = float(raw_value)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or not name:
+        return None
+    return Sample(name, labels, value)
+
+
+def parse_labels(line: str, i: int) -> tuple[dict[str, str], int] | None:
+    """Parses `name="value",name="value"}` starting at `line[i]`. Returns the labels and the
+    index just past the closing brace, or None if the text is malformed."""
+    labels: dict[str, str] = {}
+    escapes = {"\\": "\\", '"': '"', "n": "\n"}
+    while True:
+        while i < len(line) and line[i] == " ":
+            i += 1
+        if i >= len(line):
+            return None
+        if line[i] == "}":
+            return labels, i + 1
+        eq = line.find("=", i)
+        if eq == -1 or eq + 1 >= len(line) or line[eq + 1] != '"':
+            return None
+        label_name = line[i:eq].strip()
+        i = eq + 2
+        value: list[str] = []
+        while True:
+            if i >= len(line):
+                return None
+            ch = line[i]
+            if ch == "\\":
+                if i + 1 >= len(line) or line[i + 1] not in escapes:
+                    return None
+                value.append(escapes[line[i + 1]])
+                i += 2
+            elif ch == '"':
+                i += 1
+                break
+            else:
+                value.append(ch)
+                i += 1
+        if not label_name:
+            return None
+        labels[label_name] = "".join(value)
+        while i < len(line) and line[i] == " ":
+            i += 1
+        if i < len(line) and line[i] == ",":
+            i += 1
 
 
 def parse_dimension(raw: str) -> dict[str, str]:
@@ -100,24 +201,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def fetch_metrics(url: str, timeout: float) -> dict[str, float]:
+def fetch_metrics(url: str, timeout: float) -> list[Sample]:
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     return parse_prometheus_text(response.text)
 
 
 def to_metric_data(
-    metrics: dict[str, float], dimensions: list[dict[str, str]]
+    samples: list[Sample], dimensions: list[dict[str, str]]
 ) -> list[dict[str, object]]:
+    """Turns scraped series into CloudWatch data points. Each series' labels become dimensions
+    after the `--dimension` ones; a label with the same name as a `--dimension` replaces it, and
+    a label with an empty value is dropped (CloudWatch rejects empty dimension values)."""
     data = []
-    for name, value in metrics.items():
+    for sample in samples:
+        merged = {d["Name"]: d["Value"] for d in dimensions}
+        for label, label_value in sorted(sample.labels.items()):
+            if label_value:
+                merged[label] = label_value
         datum: dict[str, object] = {
-            "MetricName": name,
-            "Value": value,
-            "Unit": METRIC_UNITS.get(name, "None"),
+            "MetricName": sample.name,
+            "Value": sample.value,
+            "Unit": METRIC_UNITS.get(sample.name, "None"),
         }
-        if dimensions:
-            datum["Dimensions"] = dimensions
+        if merged:
+            datum["Dimensions"] = [{"Name": k, "Value": v} for k, v in merged.items()]
         data.append(datum)
     return data
 
@@ -126,20 +234,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
 
     try:
-        metrics = fetch_metrics(args.metrics_url, args.timeout)
+        samples = fetch_metrics(args.metrics_url, args.timeout)
     except requests.RequestException as err:
         print(f"error: failed to fetch {args.metrics_url}: {err}", file=sys.stderr)
         return 1
 
-    if not metrics:
+    if not samples:
         print(f"error: no metrics parsed from {args.metrics_url}", file=sys.stderr)
         return 1
 
-    metric_data = to_metric_data(metrics, args.dimension)
+    metric_data = to_metric_data(samples, args.dimension)
 
     cloudwatch = boto3.client("cloudwatch", region_name=args.region)
     try:
-        cloudwatch.put_metric_data(Namespace=args.namespace, MetricData=metric_data)
+        for start in range(0, len(metric_data), MAX_METRICS_PER_CALL):
+            cloudwatch.put_metric_data(
+                Namespace=args.namespace,
+                MetricData=metric_data[start : start + MAX_METRICS_PER_CALL],
+            )
     except Exception as err:  # botocore raises various ClientError subclasses
         print(f"error: failed to publish to CloudWatch: {err}", file=sys.stderr)
         return 1
