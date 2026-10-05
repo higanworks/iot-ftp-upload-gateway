@@ -50,6 +50,7 @@ async fn spawn_session(
             port_manager,
             iot_ftp_upload_gateway::metrics::Metrics::new(),
             DnsCache::new(),
+            None,
         )
         .await
         .unwrap();

@@ -42,6 +42,7 @@ async fn control_and_data_stay_on_the_backend_assigned_at_session_start() {
                 port: b.addr.port(),
             })
             .collect(),
+        backend_tls: Default::default(),
         timeouts: TimeoutConfig::default(),
         limits: LimitsConfig::default(),
         metrics: Default::default(),

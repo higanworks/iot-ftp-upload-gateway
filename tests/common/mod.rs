@@ -9,6 +9,8 @@
 //! there -- hence the blanket `dead_code` allow rather than per-item ones.
 #![allow(dead_code)]
 
+pub mod tls;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -242,6 +244,7 @@ pub async fn spawn_session_with_limits(
             port_manager,
             iot_ftp_upload_gateway::metrics::Metrics::new(),
             DnsCache::new(),
+            None,
         )
         .await
     });

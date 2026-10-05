@@ -54,7 +54,9 @@ multiple gateway instances.
 Only the commands an IoT device needs to upload a file are implemented: `USER`, `PASS`,
 `SYST`, `TYPE`, `PWD`, `CWD`, `PASV`, `EPSV`, `STOR`, `MKD`, `QUIT`, `NOOP`. Any other command
 (`RETR`, `LIST`, `PORT`, etc.) is rejected with `502` and never reaches a Backend. IPv4 and
-passive mode only; no FTPS/TLS, no Active mode, no IPv6, no general FTP command support.
+passive mode only; no Active mode, no IPv6, no general FTP command support. Clients always speak
+plain FTP to the gateway (it does not terminate FTPS); the gateway-to-backend leg can optionally
+be Explicit FTPS — see [Backend FTPS](#backend-ftps).
 
 `EPSV` (RFC 2428) is accepted alongside `PASV` and shares the exact same port pool and data
 relay — some clients (and any client whose control connection happens to be IPv6, since PASV's
@@ -134,6 +136,10 @@ config file and overridden per-environment via env vars.
 | Max concurrent connections per client IP | `limits.max_connections_per_ip` | `GATEWAY_MAX_CONNECTIONS_PER_IP` | `10` (`0` disables) |
 | Metrics endpoint bind address | `metrics.address` | `GATEWAY_METRICS_ADDRESS` | `127.0.0.1` |
 | Metrics endpoint port | `metrics.port` | `GATEWAY_METRICS_PORT` | *(unset — endpoint disabled)* |
+| Backend TLS mode | `backend_tls.mode` | `GATEWAY_BACKEND_TLS` (`off` / `explicit`) | `off` |
+| Backend TLS CA bundle (PEM) | `backend_tls.ca_file` | `GATEWAY_BACKEND_TLS_CA_FILE` | *(unset — bundled public roots)* |
+| Backend TLS server name | `backend_tls.server_name` | `GATEWAY_BACKEND_TLS_SERVER_NAME` | *(unset — each backend's `host`)* |
+| Backend TLS max version | `backend_tls.max_version` | `GATEWAY_BACKEND_TLS_MAX_VERSION` (`1.3` / `1.2`) | `1.3` |
 
 A control line (a client command or a backend reply) that exceeds `max_command_line_bytes`
 without a terminating newline ends the session — a client hits `500 Command line too long`; a
@@ -161,6 +167,40 @@ clients in the PASV reply — it is *not* the bind address. The PASV data listen
 load balancer or container-published address); binding to that same address instead would make
 the listener unreachable behind NAT/containers, which is exactly the deployment this gateway
 targets.
+
+## Backend FTPS
+
+By default the gateway talks plain FTP to the backends. Setting `backend_tls.mode: explicit`
+(`GATEWAY_BACKEND_TLS=explicit`) encrypts that leg with Explicit FTPS (RFC 4217) while clients
+keep speaking plain FTP to the gateway. The setting applies to every backend.
+
+For each backend session the gateway itself sends `AUTH TLS`, completes the TLS handshake, then
+sends `PBSZ 0` and `PROT P` — before the client sees the backend's banner — so both the control
+connection and every data connection to the backend are encrypted. Clients never see or send any
+of these commands (a client-sent `AUTH` is still rejected with `502`).
+
+- **Fails closed.** If the backend refuses `AUTH TLS`/`PROT P`, the handshake fails, or the
+  certificate doesn't verify, the client gets `421` and the session ends. There is no fallback to
+  plain FTP, and no option to skip certificate verification.
+- **Certificate verification.** The certificate is checked against `backend_tls.server_name`, or
+  each backend's `host` when unset — never against the IP in a PASV reply. Set `server_name` when
+  the backend is reached by a name its certificate doesn't cover. `ca_file` (PEM, may hold several
+  certificates) replaces the bundled public CA roots, for a private CA. A bad `ca_file` is a
+  startup error.
+- **Session reuse.** Many FTPS servers (e.g. vsftpd's default `require_ssl_reuse=YES`) only accept
+  a data connection that resumes the control connection's TLS session. The gateway shares one TLS
+  client configuration across all connections so data connections attempt to resume it. If a
+  backend rejects data connections under TLS 1.3, try `max_version: "1.2"`. Confirm resumption
+  works against your actual backend before relying on it.
+- **Data connection handshake.** As servers expect, the data connection's TLS handshake happens
+  after `STOR` is sent and answered with `150`, not when the data connection is opened.
+- **Logging.** A failure to secure the control connection is logged at `WARN` ("failed to
+  establish TLS with backend"). A data-connection handshake failure is logged at `WARN` as
+  "upload failed: data relay error", with the TLS error in the `error` field.
+
+Because the gateway acts as the TLS client on both connections, it trusts the backend's
+certificate exactly as strictly as any other FTPS client would; it does not terminate TLS for
+devices.
 
 ## Docker
 

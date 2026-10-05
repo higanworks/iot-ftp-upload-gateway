@@ -11,6 +11,10 @@
 #   GATEWAY_BACKENDS                 (example: "ftp01:21,ftp02:21")
 #   GATEWAY_CONNECTION_TIMEOUT_SECS
 #   GATEWAY_IDLE_TIMEOUT_SECS
+#   GATEWAY_BACKEND_TLS              ("off" or "explicit")
+#   GATEWAY_BACKEND_TLS_CA_FILE
+#   GATEWAY_BACKEND_TLS_SERVER_NAME
+#   GATEWAY_BACKEND_TLS_MAX_VERSION  ("1.3" or "1.2")
 
 listen:
   address: 0.0.0.0
@@ -27,6 +31,16 @@ backends:
     port: 21
   - host: ftp02
     port: 21
+
+# Optional: encrypt the gateway -> backend leg with Explicit FTPS (control and data connections).
+# Clients still speak plain FTP to the gateway. Applies to every backend above. When enabled,
+# a backend that can't complete the TLS negotiation ends the session with `421`; there is no
+# fallback to plain FTP.
+#backend_tls:
+#  mode: explicit                  # "off" (default) or "explicit"
+#  ca_file: /etc/gateway/ca.pem    # PEM CA bundle; omit to trust the bundled public CA roots
+#  server_name: ftp.example.com    # SNI / certificate name; omit to use each backend's `host`
+#  max_version: "1.3"              # "1.2" pins TLS 1.2 (see README, "Backend FTPS")
 
 timeouts:
   connection_timeout_secs: 10
