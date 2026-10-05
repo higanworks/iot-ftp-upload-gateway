@@ -60,8 +60,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         let metrics_addr = SocketAddr::new(config.metrics.address, metrics_port);
         let metrics = Arc::clone(&metrics);
         let port_manager = port_manager.clone();
+        let source_rotator = source_rotator.clone();
         tokio::spawn(async move {
-            if let Err(err) = metrics_server::run(metrics_addr, metrics, port_manager).await {
+            if let Err(err) =
+                metrics_server::run(metrics_addr, metrics, port_manager, source_rotator).await
+            {
                 tracing::warn!(error = %err, "metrics endpoint stopped");
             }
         });

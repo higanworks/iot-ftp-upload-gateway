@@ -311,6 +311,13 @@ pub struct LimitsConfig {
     /// 5, "Connection Exhaustion"). Operators behind carrier-grade NAT -- where many IoT devices
     /// can share one public IP -- should raise this or disable it.
     pub max_connections_per_ip: usize,
+    /// Only accept a client's data connection (to the PASV port the gateway announced) from the
+    /// same IP address as that client's control connection (default `true`). The PASV port is
+    /// open to the whole network from the moment it is announced, so without this a host that
+    /// connects to it first would have its bytes uploaded under the real client's filename.
+    /// Set to `false` only if devices legitimately open their data connections from a different
+    /// address than their control connections (some carrier-grade NAT pools do).
+    pub require_data_ip_match: bool,
 }
 
 impl Default for LimitsConfig {
@@ -318,6 +325,7 @@ impl Default for LimitsConfig {
         LimitsConfig {
             max_command_line_bytes: 4096,
             max_connections_per_ip: 10,
+            require_data_ip_match: true,
         }
     }
 }
@@ -442,6 +450,10 @@ impl Config {
                 .parse()
                 .context("invalid GATEWAY_MAX_CONNECTIONS_PER_IP")?;
         }
+        if let Some(v) = env_var("GATEWAY_REQUIRE_DATA_IP_MATCH")? {
+            self.limits.require_data_ip_match =
+                parse_bool(&v).context("invalid GATEWAY_REQUIRE_DATA_IP_MATCH")?;
+        }
         if let Some(v) = env_var("GATEWAY_METRICS_ADDRESS")? {
             self.metrics.address = v.parse().context("invalid GATEWAY_METRICS_ADDRESS")?;
         }
@@ -487,6 +499,15 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+/// Parses `true`/`false` (case-insensitive) or `1`/`0`.
+fn parse_bool(raw: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        other => bail!("'{other}' is not a boolean (expected true/false or 1/0)"),
     }
 }
 
@@ -727,6 +748,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn data_ip_match_defaults_to_required_and_can_be_switched_off() {
+        assert!(Config::default().limits.require_data_ip_match);
+        let config: Config =
+            serde_yaml::from_str("limits:\n  require_data_ip_match: false\n").unwrap();
+        assert!(!config.limits.require_data_ip_match);
+        // Other limits keep their defaults when only this one is given.
+        assert_eq!(config.limits.max_connections_per_ip, 10);
+    }
+
+    #[test]
+    fn parses_booleans_from_env_style_text() {
+        for truthy in ["true", "TRUE", "1", " true "] {
+            assert!(parse_bool(truthy).unwrap(), "{truthy}");
+        }
+        for falsy in ["false", "False", "0"] {
+            assert!(!parse_bool(falsy).unwrap(), "{falsy}");
+        }
+        assert!(parse_bool("yes").is_err());
+        assert!(parse_bool("").is_err());
     }
 
     #[test]

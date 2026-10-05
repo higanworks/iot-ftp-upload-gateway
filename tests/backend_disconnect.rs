@@ -81,7 +81,7 @@ async fn backend_closes_before_banner_returns_421() {
 }
 
 #[tokio::test]
-async fn backend_disconnect_before_data_connection_returns_425_and_releases_port() {
+async fn backend_disconnect_before_data_connection_returns_421_and_releases_port() {
     let backend_addr = common::spawn_mock_backend_disconnecting_after_login().await;
     let backend_config = BackendConfig {
         host: backend_addr.ip().to_string(),
@@ -113,7 +113,8 @@ async fn backend_disconnect_before_data_connection_returns_425_and_releases_port
     // The backend is already gone by this point (it disconnects right after PASS). PASV is
     // handled entirely gateway-side, so it still succeeds; the backend is only contacted when
     // the client's data connection arrives and the gateway tries to open its own PASV data
-    // connection to the backend, which is where this should fail.
+    // connection to the backend, which is where this should fail. Its control connection is
+    // dead, so the session ends there and then with 421 rather than limping on.
     conn.write_all(b"PASV\r\n").await.unwrap();
     let pasv_reply = common::read_reply(&mut conn).await;
     assert!(pasv_reply.starts_with("227"), "{pasv_reply}");
@@ -122,7 +123,7 @@ async fn backend_disconnect_before_data_connection_returns_425_and_releases_port
 
     conn.write_all(b"STOR whatever.txt\r\n").await.unwrap();
     let stor_reply = common::read_reply(&mut conn).await;
-    assert!(stor_reply.starts_with("425"), "{stor_reply}");
+    assert!(stor_reply.starts_with("421"), "{stor_reply}");
 
     // The port must be available again even though the backend (not the client) is what failed.
     let guard = port_manager.allocate().await;
@@ -132,10 +133,9 @@ async fn backend_disconnect_before_data_connection_returns_425_and_releases_port
     );
     drop(guard);
 
-    // The control connection is still nominally open from the client's side, but every further
-    // command needs the (now-dead) backend connection, so the session should end the next time
-    // one is sent.
-    conn.write_all(b"QUIT\r\n").await.unwrap();
+    // The session has ended: nothing further can be done without the backend connection. (The
+    // client's write may or may not still succeed, depending on how far the close has got.)
+    let _ = conn.write_all(b"QUIT\r\n").await;
     let result = await_session(session_task).await;
     assert!(
         result.is_ok(),

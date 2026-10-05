@@ -170,6 +170,7 @@ config file and overridden per-environment via env vars.
 | Data connection idle timeout (secs) | `timeouts.data_idle_timeout_secs` | `GATEWAY_DATA_IDLE_TIMEOUT_SECS` | `60` |
 | Max control-line length (bytes) | `limits.max_command_line_bytes` | `GATEWAY_MAX_COMMAND_LINE_BYTES` | `4096` |
 | Max concurrent connections per client IP | `limits.max_connections_per_ip` | `GATEWAY_MAX_CONNECTIONS_PER_IP` | `10` (`0` disables) |
+| Require data connection from the control connection's IP | `limits.require_data_ip_match` | `GATEWAY_REQUIRE_DATA_IP_MATCH` (`true` / `false`) | `true` |
 | Metrics endpoint bind address | `metrics.address` | `GATEWAY_METRICS_ADDRESS` | `127.0.0.1` |
 | Metrics endpoint port | `metrics.port` | `GATEWAY_METRICS_PORT` | *(unset — endpoint disabled)* |
 | Backend TLS mode | `backend_tls.mode` | `GATEWAY_BACKEND_TLS` (`off` / `explicit`) | `off` |
@@ -192,6 +193,21 @@ closed) once a single client IP already holds that many open — without it, one
 malicious source could open unlimited connections and exhaust file descriptors/memory on its
 own. Set to `0` to disable the check entirely. Operators behind carrier-grade NAT, where many IoT
 devices can share one public IP, should raise this or disable it.
+
+`require_data_ip_match` (default `true`) only accepts a client's data connection from the same IP
+address as that client's control connection. The PASV port the gateway announces is open to the
+whole network until the client connects to it, so without this check any host that reached the
+port first would become the data connection for that client's upload — its bytes stored under the
+real client's filename. A connection from any other address is logged at `WARN`, closed, and
+counted (`ftp_gateway_data_connections_rejected_total`); the gateway keeps waiting for the real
+one until the data connection wait (`timeouts.connection_timeout_secs`) runs out, so connecting
+to the port cannot keep the real client out. Two deployments need care:
+
+- **Devices whose control and data connections leave from different addresses** — some
+  carrier-grade NAT pools do this — would be refused. Set it to `false` for them.
+- **A load balancer in front of the gateway that does not preserve the client IP** makes every
+  connection look like it comes from the balancer, so the check always passes and protects
+  nothing.
 
 Backends are selected round-robin per session; a session's control connection and any PASV
 data connections always stay on the same backend for the lifetime of that session.
@@ -600,6 +616,26 @@ short ones. The gateway itself doesn't impose an artificial concurrency cap; a t
 `accept()` failure (e.g. hitting the fd limit) is logged and the gateway keeps serving existing
 sessions rather than crashing.
 
+**Timeouts toward the backend.** Every wait on a backend is bounded, so one that stops
+responding cannot hold a session — and the PASV port and source-address slot it has claimed —
+forever: connecting takes at most `timeouts.connection_timeout_secs`, each reply (including the
+reply to the gateway's own `PASV`) at most `timeouts.command_timeout_secs`, and an idle data
+transfer at most `timeouts.data_idle_timeout_secs`. A backend `PASV` reply that never arrives, is
+cut off, or is longer than `limits.max_command_line_bytes` ends the session with `421`: the
+connection can no longer be trusted to be in step, since a reply that turned up late would be
+read as the answer to the next command. (A reply that arrives but isn't a PASV address, or a
+data port that can't be reached, only fails that transfer with `425`.)
+
+**Several gateway instances behind a load balancer.** The PASV reply tells the client where to
+open its data connection, and that connection must reach the *same instance* that holds the
+control connection. Each instance therefore has to advertise an address that leads to that
+instance itself (`passive.address`), not the load balancer's shared address: a balancer may send
+the data connection to a different instance, which either has nothing listening on that port or
+— worse — has *another client's* PASV listener on the same port number. `require_data_ip_match`
+refuses such a mix-up when the two clients have different IPs, but it cannot tell two clients
+behind one NAT apart, so do not rely on it for this. A single gateway behind an NLB, or several
+reached through per-instance addresses (see DNS round-robin below), has no such problem.
+
 **DNS round-robin deployment.** Each gateway instance is fully independent — no state is shared
 between instances (the PASV port pool and backend round-robin counter are both in-process only).
 DNS round-robin distributes *new* sessions across instances; a long-running session stays pinned
@@ -653,16 +689,41 @@ curl http://127.0.0.1:9273/metrics
 | `ftp_gateway_sessions_active` | gauge | FTP control connections currently open |
 | `ftp_gateway_uploads_active` | gauge | `STOR` transfers currently in progress |
 | `ftp_gateway_pasv_ports_active` | gauge | PASV/EPSV data ports currently allocated |
+| `ftp_gateway_pasv_ports_capacity` | gauge | PASV/EPSV data ports in the configured range (capacity − active is what is left) |
 | `ftp_gateway_sessions_total` | counter | Total control connections accepted |
 | `ftp_gateway_upload_bytes_total` | counter | Total bytes relayed to a Backend across all completed `STOR` transfers |
 | `ftp_gateway_connections_rejected_total` | counter | Total connections rejected by the per-IP connection limit |
+| `ftp_gateway_uploads_started_total` | counter | `STOR` transfers that reached the Backend (both data connections up) |
+| `ftp_gateway_uploads_completed_total` | counter | Started transfers the Backend confirmed with a `2xx` reply |
+| `ftp_gateway_uploads_failed_total` | counter | Started transfers that did not complete, however they ended |
+| `ftp_gateway_backend_pasv_failures_total` | counter | Times the Backend gave no usable reply to `PASV` (none in time, cut off, too long, or not an address) |
+| `ftp_gateway_backend_data_connection_failures_total` | counter | Failures to establish a data connection to the Backend (TCP connect, or the TLS handshake with `backend_tls`) |
+| `ftp_gateway_data_connections_rejected_total` | counter | Client data connections closed for coming from a different IP than the control connection |
+| `ftp_gateway_backend_timeouts_total` | counter | Timeouts waiting on, or connecting to, a Backend |
+| `ftp_gateway_session_idle_timeouts_total` | counter | Control sessions closed for being idle too long |
 
+With [source rotation](#backend-source-rotation) on, there are also per-source-address series,
+which show whether a source has reached the backend's concurrency limit
+(`transfers_active` against `transfers_capacity`, and `slot_timeouts_total` counting the uploads
+answered `425` for lack of a slot):
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `ftp_gateway_backend_source_unhealthy` | gauge | `source` | `1` while the source address is left out of the rotation after failing to connect |
+| `ftp_gateway_backend_source_transfers_active` | gauge | `backend`, `source` | Data transfers in flight from this source to this backend |
+| `ftp_gateway_backend_source_transfers_capacity` | gauge | `backend`, `source` | Most transfers allowed at once (the backend's `passive_ports` size) |
+| `ftp_gateway_backend_source_transfers_total` | counter | `backend`, `source` | Transfers started from this source to this backend |
+| `ftp_gateway_backend_source_slot_timeouts_total` | counter | `backend`, `source` | Transfers that gave up waiting for a free slot |
+
+The number of these series is fixed by the number of source addresses and backends — nothing a
+client sends can add one.
 Every `_total` counter uses saturating addition, so it holds at `u64::MAX` under sustained load
 instead of wrapping back to a small number.
 
 By default `metrics.address` / `GATEWAY_METRICS_ADDRESS` binds to loopback (`127.0.0.1`) only —
-this endpoint carries no per-client secrets (no filenames, IPs, or credentials), but it also
-isn't meant to be reachable straight from the Internet by default. A sidecar/same-pod Prometheus
+this endpoint carries no per-client data (no filenames, client IPs, or credentials) — with source
+rotation on it does show the gateway's own source addresses and the backends' `host:port` — but
+it also isn't meant to be reachable straight from the Internet by default. A sidecar/same-pod Prometheus
 scraper (the common Kubernetes shape) reaches loopback fine; set this to `0.0.0.0` (and publish
 the port, e.g. in `docker-compose.yml`) if something outside the container/pod needs to scrape
 it directly.

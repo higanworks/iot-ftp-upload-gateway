@@ -10,6 +10,46 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+### Added
+
+- More metrics on `/metrics`: `ftp_gateway_uploads_started_total`, `_completed_total` and
+  `_failed_total`; `ftp_gateway_backend_pasv_failures_total`,
+  `ftp_gateway_backend_data_connection_failures_total`, `ftp_gateway_backend_timeouts_total`,
+  `ftp_gateway_data_connections_rejected_total`, `ftp_gateway_session_idle_timeouts_total` and
+  `ftp_gateway_pasv_ports_capacity`; and, with source rotation on, per-source series
+  (`ftp_gateway_backend_source_unhealthy`, `..._transfers_active`, `..._transfers_capacity`,
+  `..._transfers_total`, `..._slot_timeouts_total`) showing whether a source address has reached
+  the backend's concurrency limit.
+
+### Security
+
+- A client's data connection is now only accepted from the same IP address as its control
+  connection (`limits.require_data_ip_match`, **on by default**; `GATEWAY_REQUIRE_DATA_IP_MATCH`).
+  The PASV port the gateway announces is open to the whole network until the client connects to
+  it, so previously any host that reached the port first became the data connection for that
+  client's upload — its bytes stored under the real client's filename. Connections from other
+  addresses are closed and logged, and the gateway keeps waiting for the real one. **Upgrade
+  note:** devices whose control and data connections leave from different addresses (some
+  carrier-grade NAT pools) are refused with the default; set the option to `false` for them. It
+  does nothing behind a load balancer that does not preserve the client IP.
+
+### Fixed
+
+- A backend that stopped answering `PASV` could hold a gateway session, the PASV port and (with
+  source rotation) the source-address slot forever, because the reply was awaited without any
+  timeout, line-length limit, or a timeout on connecting to the data port it announced. The reply
+  now gets `timeouts.command_timeout_secs` and the `limits.max_command_line_bytes` cap, and the
+  data port connection `timeouts.connection_timeout_secs`.
+
+### Changed
+
+- When the backend's `PASV` reply does not arrive, is cut off, or is overlong, or the backend
+  closes its control connection, the session now ends with `421` instead of answering the
+  upload with `425` and carrying on: the backend connection can no longer be trusted to be in
+  step with the commands sent, since a late reply would be read as the answer to the next one.
+  (A complete reply that is not a PASV address, or a data port that cannot be reached, still
+  fails only that upload with `425`.)
+
 ## [2026.10.0] - 2026-10-06
 
 ### Added

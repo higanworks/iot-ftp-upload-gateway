@@ -1,10 +1,10 @@
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::backend;
 use crate::backend::dns_cache::DnsCache;
@@ -29,6 +29,39 @@ struct DataChannel {
     _data_slot: Option<DataSlot>,
 }
 
+/// Accepts the client's data connection on its PASV `listener`, giving up after `timeout`.
+///
+/// With `expected_ip`, a connection from any other address is closed at once and the wait goes on:
+/// the PASV port is open to the whole network from the moment it is announced, so whichever host
+/// connects first would otherwise become the data connection for this client's upload. The
+/// timeout covers the whole wait, so connecting and dropping repeatedly can neither keep the
+/// legitimate client out nor stretch the wait.
+async fn accept_client_data(
+    listener: &TcpListener,
+    expected_ip: Option<IpAddr>,
+    timeout: Duration,
+    metrics: &Metrics,
+) -> Result<io::Result<(TcpStream, SocketAddr)>, tokio::time::error::Elapsed> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            match expected_ip {
+                Some(expected) if peer.ip() != expected => {
+                    metrics.data_connection_rejected();
+                    tracing::warn!(
+                        data_peer = %peer,
+                        expected_ip = %expected,
+                        "rejected a data connection from a different IP address than the control connection"
+                    );
+                    // `stream` is dropped here, closing the connection.
+                }
+                _ => return Ok::<_, io::Error>((stream, peer)),
+            }
+        }
+    })
+    .await
+}
+
 /// Treats an I/O failure on the *client* connection as a normal disconnect (PROJECT_ADDITION.ja.md
 /// section 2: on an unreliable mobile network, connection loss is expected, not exceptional).
 /// Logs at INFO and ends the session immediately rather than propagating as an error.
@@ -47,10 +80,11 @@ macro_rules! client_io {
 /// Treats an I/O failure or timeout talking to the *backend* as a backend-side problem: unlike
 /// the client, the backend is our own infrastructure, so this is logged at WARN.
 macro_rules! backend_io {
-    ($expr:expr) => {
+    ($metrics:expr, $expr:expr) => {
         match $expr {
             Ok(value) => value,
             Err(err) => {
+                $metrics.observe_backend_io_error(&err);
                 tracing::warn!(error = %err, "backend connection failed");
                 return Ok(());
             }
@@ -150,6 +184,13 @@ pub async fn handle(
     let command_timeout = Duration::from_secs(timeouts.command_timeout_secs);
     let data_idle_timeout = Duration::from_secs(timeouts.data_idle_timeout_secs);
     let max_command_line_bytes = limits.max_command_line_bytes;
+    // The backend's PASV reply gets the same bounds as every other backend reply; connecting to
+    // the data port it names is bounded like connecting to the backend itself.
+    let connect_limits = relay::DataConnectLimits {
+        reply_timeout: command_timeout,
+        connect_timeout: connection_timeout,
+        max_line_bytes: max_command_line_bytes,
+    };
 
     let backend_key = format!("{}:{}", backend_config.host, backend_config.port);
     let connected = match &source_rotator {
@@ -157,6 +198,7 @@ pub async fn handle(
             .await
             .map(|stream| (stream, None))
             .map_err(|err| {
+                metrics.observe_backend_io_error(&err);
                 tracing::warn!(error = %err, "failed to connect to backend");
             }),
         Some(rotator) => {
@@ -177,6 +219,7 @@ pub async fn handle(
                         break;
                     }
                     Err(err) => {
+                        metrics.observe_backend_io_error(&err);
                         tracing::warn!(source_ip = %source, error = %err, "failed to connect to backend from this source address");
                         rotator.report_connect_failure(source, &err);
                     }
@@ -208,6 +251,7 @@ pub async fn handle(
     // Relay the backend's initial banner to the client as-is.
     let mut line = String::new();
     let banner_bytes = backend_io!(
+        metrics,
         read_line_with_timeout(
             &mut backend_conn,
             &mut line,
@@ -240,6 +284,7 @@ pub async fn handle(
         {
             Ok(conn) => conn,
             Err(err) => {
+                metrics.observe_backend_io_error(&err);
                 tracing::warn!(error = %err, "failed to establish TLS with backend");
                 let _ = client_conn
                     .write_all(b"421 Service not available\r\n")
@@ -360,7 +405,9 @@ pub async fn handle(
                     // be connecting right now); accept it here rather than racing this against
                     // control-line reads in the select loop above, which starves this accept
                     // when the client sends further commands back-to-back before we get a turn.
-                    let channel = match tokio::time::timeout(connection_timeout, guard.listener().accept()).await {
+                    let mut backend_control_lost = false;
+                    let expected_data_ip = limits.require_data_ip_match.then_some(peer_addr.ip());
+                    let channel = match accept_client_data(guard.listener(), expected_data_ip, connection_timeout, &metrics).await {
                         Ok(Ok((client_data, data_peer))) => {
                             tracing::info!(%data_peer, port, "data connection accepted");
                             // With source rotation, claim this transfer's slot on the session's
@@ -387,7 +434,7 @@ pub async fn handle(
                                 None => None,
                                 Some(data_slot) => {
                                     let local_ip = rotation.as_ref().map(|(_, source)| *source);
-                                    match relay::open_backend_data_connection(&mut backend_conn, local_ip).await {
+                                    match relay::open_backend_data_connection(&mut backend_conn, local_ip, connect_limits).await {
                                         Ok(backend_data) => {
                                             if rotation.is_some()
                                                 && !warned_port_outside_range
@@ -404,12 +451,30 @@ pub async fn handle(
                                             }
                                             Some(DataChannel { client_data, backend_data, _data_slot: data_slot })
                                         }
+                                        Err(err @ relay::DataConnectError::ControlConnection(_)) => {
+                                            // No reply, a cut-off one, or an overlong one: the control
+                                            // connection is out of step with us from here on.
+                                            tracing::warn!(error = %err, "backend control connection unusable while opening a data connection");
+                                            metrics.backend_pasv_failed();
+                                            if let Some(io_err) = err.io_error() {
+                                                metrics.observe_backend_io_error(io_err);
+                                            }
+                                            backend_control_lost = true;
+                                            None
+                                        }
+                                        Err(err @ relay::DataConnectError::UnusableReply(_)) => {
+                                            tracing::warn!(error = %err, "failed to open backend data connection");
+                                            metrics.backend_pasv_failed();
+                                            None
+                                        }
                                         Err(err) => {
                                             tracing::warn!(error = %err, "failed to open backend data connection");
-                                            if let Some((rotator, source)) = &rotation
-                                                && let Some(io_err) = err.root_cause().downcast_ref::<io::Error>()
-                                            {
-                                                rotator.report_connect_failure(*source, io_err);
+                                            metrics.backend_data_connection_failed();
+                                            if let Some(io_err) = err.io_error() {
+                                                metrics.observe_backend_io_error(io_err);
+                                                if let Some((rotator, source)) = &rotation {
+                                                    rotator.report_connect_failure(*source, io_err);
+                                                }
                                             }
                                             None
                                         }
@@ -429,14 +494,26 @@ pub async fn handle(
                     // `guard` is dropped here either way, releasing the port back to the pool.
                     tracing::info!(port, "PASV port released");
 
+                    if backend_control_lost {
+                        // A late PASV reply would be taken for the answer to the next command, so
+                        // this backend connection cannot be used any further.
+                        let _ = client_conn
+                            .write_all(b"421 Service not available\r\n")
+                            .await;
+                        break;
+                    }
+
                     if let Some(mut channel) = channel {
                         let upload_start = Instant::now();
                         tracing::info!(%filename_log, "upload started");
+                        // Records how this upload ends: failed unless `succeeded()` is called, so
+                        // every early exit below counts without each one having to say so.
+                        let upload_attempt = metrics.upload_attempted();
 
-                        backend_io!(backend_conn.write_all(line.as_bytes()).await);
+                        backend_io!(metrics, backend_conn.write_all(line.as_bytes()).await);
 
                         let mut backend_reply = String::new();
-                        let reply_bytes = backend_io!(
+                        let reply_bytes = backend_io!(metrics,
                             read_line_with_timeout(
                                 &mut backend_conn,
                                 &mut backend_reply,
@@ -479,6 +556,11 @@ pub async fn handle(
                             None => Ok(BackendStream::Plain(channel.backend_data)),
                         };
 
+                        if let Err(err) = &backend_data {
+                            metrics.backend_data_connection_failed();
+                            metrics.observe_backend_io_error(err);
+                        }
+
                         // Move the file bytes only after the backend confirmed it is ready (150).
                         let _upload_guard = metrics.upload_started();
                         let relay_result = match backend_data {
@@ -507,7 +589,7 @@ pub async fn handle(
                         tracing::info!(%filename_log, "data connection closed");
 
                         let mut completion = String::new();
-                        let completion_bytes = backend_io!(
+                        let completion_bytes = backend_io!(metrics,
                             read_line_with_timeout(
                                 &mut backend_conn,
                                 &mut completion,
@@ -526,6 +608,7 @@ pub async fn handle(
                         let completion_trimmed = completion.trim_end_matches(['\r', '\n']);
                         let duration_ms = upload_start.elapsed().as_millis() as u64;
                         if completion_trimmed.starts_with('2') {
+                            upload_attempt.succeeded();
                             tracing::info!(%filename_log, reply = %completion_trimmed, duration_ms, "upload finished");
                         } else {
                             tracing::warn!(%filename_log, reply = %completion_trimmed, duration_ms, "upload failed");
@@ -546,10 +629,10 @@ pub async fn handle(
                 // If this was a STOR without a PASV port allocated, fall through and let
                 // the backend respond with its own error (e.g. "425 Use PASV first").
 
-                backend_io!(backend_conn.write_all(line.as_bytes()).await);
+                backend_io!(metrics, backend_conn.write_all(line.as_bytes()).await);
 
                 let mut backend_reply = String::new();
-                let reply_bytes = backend_io!(
+                let reply_bytes = backend_io!(metrics,
                     read_line_with_timeout(
                         &mut backend_conn,
                         &mut backend_reply,
@@ -577,6 +660,7 @@ pub async fn handle(
             }
 
             _ = tokio::time::sleep(idle_timeout) => {
+                metrics.session_idle_timed_out();
                 tracing::warn!(idle_timeout_secs = timeouts.idle_timeout_secs, "idle timeout reached");
                 let _ = client_conn.write_all(b"421 Idle timeout, closing control connection\r\n").await;
                 break;
@@ -590,4 +674,96 @@ pub async fn handle(
 
     tracing::info!("session ended");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    /// Not this machine's address as seen by a client connecting from 127.0.0.1.
+    const OTHER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+
+    async fn listener() -> (TcpListener, SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    #[tokio::test]
+    async fn accepts_a_connection_from_the_expected_ip() {
+        let (listener, addr) = listener().await;
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let metrics = Metrics::new();
+        let (_stream, peer) =
+            accept_client_data(&listener, Some(LOOPBACK), Duration::from_secs(5), &metrics)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(peer.ip(), LOOPBACK);
+        assert!(
+            metrics
+                .render(0, 0, None)
+                .contains("ftp_gateway_data_connections_rejected_total 0\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_expected_ip_any_connection_is_accepted() {
+        let (listener, addr) = listener().await;
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let accepted =
+            accept_client_data(&listener, None, Duration::from_secs(5), &Metrics::new()).await;
+        assert!(accepted.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_connection_from_another_ip_is_closed_and_the_wait_times_out() {
+        let (listener, addr) = listener().await;
+        // The client connects from 127.0.0.1, but the control connection "came from" 127.0.0.2.
+        let metrics = Metrics::new();
+        let (accepted, bytes_read) = tokio::join!(
+            accept_client_data(&listener, Some(OTHER), Duration::from_millis(300), &metrics),
+            async {
+                let mut client = TcpStream::connect(addr).await.unwrap();
+                let mut buf = [0u8; 1];
+                // The gateway closes it: EOF (or a reset), never data.
+                tokio::io::AsyncReadExt::read(&mut client, &mut buf)
+                    .await
+                    .unwrap_or(0)
+            }
+        );
+        assert!(accepted.is_err(), "nothing acceptable ever connected");
+        assert_eq!(bytes_read, 0);
+        // The refusal was counted.
+        assert!(
+            metrics
+                .render(0, 0, None)
+                .contains("ftp_gateway_data_connections_rejected_total 1\n")
+        );
+    }
+
+    /// Needs a second local address to connect from, which Linux gives every 127.0.0.0/8 address.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_rejected_connection_does_not_keep_out_the_expected_one() {
+        use tokio::net::TcpSocket;
+
+        let metrics = Metrics::new();
+        let (listener, addr) = listener().await;
+        let (accepted, _clients) = tokio::join!(
+            accept_client_data(&listener, Some(LOOPBACK), Duration::from_secs(5), &metrics),
+            async {
+                // The intruder gets there first, from 127.0.0.2...
+                let intruder = TcpSocket::new_v4().unwrap();
+                intruder.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+                let intruder = intruder.connect(addr).await.unwrap();
+                // ...then the real client, from 127.0.0.1.
+                let client = TcpStream::connect(addr).await.unwrap();
+                (intruder, client)
+            }
+        );
+        let (_stream, peer) = accepted.unwrap().unwrap();
+        assert_eq!(peer.ip(), LOOPBACK);
+    }
 }
