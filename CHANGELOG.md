@@ -10,6 +10,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.10.1] - 2026-10-06
+
 ### Added
 
 - More metrics on `/metrics`: `ftp_gateway_uploads_started_total`, `_completed_total` and
@@ -191,7 +193,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.0...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.1...HEAD
+[2026.10.1]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.0...v2026.10.1
 [2026.10.0]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.5...v2026.10.0
 [2026.9.5]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.4...v2026.9.5
 [2026.9.4]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.3...v2026.9.4
