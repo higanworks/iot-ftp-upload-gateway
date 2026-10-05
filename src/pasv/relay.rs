@@ -5,12 +5,17 @@ use anyhow::{Context, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use crate::backend::tls::BackendStream;
 use crate::protocol::reply::parse_pasv_reply;
 
 /// Asks the backend to open a passive data connection and connects to the address/port
 /// it returns. The Gateway itself acts as a PASV client toward the backend here.
+///
+/// This only opens the TCP connection. With backend FTPS the TLS handshake on a data connection
+/// cannot happen here: servers start it only once the transfer command (`STOR`) has been
+/// received, so the caller performs it after forwarding `STOR` and getting the `150` reply.
 pub async fn open_backend_data_connection(
-    backend_control: &mut BufReader<TcpStream>,
+    backend_control: &mut BufReader<BackendStream>,
 ) -> anyhow::Result<TcpStream> {
     backend_control.write_all(b"PASV\r\n").await?;
 
@@ -38,11 +43,13 @@ pub async fn open_backend_data_connection(
 /// held open forever.
 pub async fn relay_bidirectional(
     client_data: &mut TcpStream,
-    backend_data: &mut TcpStream,
+    backend_data: &mut BackendStream,
     idle_timeout: Duration,
 ) -> io::Result<(u64, u64)> {
     let (mut client_read, mut client_write) = client_data.split();
-    let (mut backend_read, mut backend_write) = backend_data.split();
+    // A TLS stream can't be `split()` by reference like a TcpStream; `tokio::io::split` works
+    // for both variants of `BackendStream`.
+    let (mut backend_read, mut backend_write) = tokio::io::split(backend_data);
 
     tokio::try_join!(
         copy_with_idle_timeout(&mut client_read, &mut backend_write, idle_timeout),
@@ -58,6 +65,11 @@ const RELAY_BUFFER_BYTES: usize = 65536;
 /// Copies from `reader` to `writer` until EOF, shutting down `writer` when the source is
 /// exhausted (preserving TCP half-close: the other direction of the pair keeps running
 /// independently). Returns a `TimedOut` error if no byte is read within `idle_timeout`.
+///
+/// A TLS peer that drops the TCP connection without `close_notify` surfaces as `UnexpectedEof`
+/// on read; that is treated as a plain end-of-stream rather than a failure. Both directions of
+/// this relay are guarded by the application-level reply on the control connection, not by TLS
+/// truncation detection, so this loses nothing -- and many FTP servers close that way.
 ///
 /// The idle timer is a single `Sleep` reset on every read rather than a fresh
 /// `tokio::time::timeout` per call: re-wrapping every read would register and cancel a new
@@ -81,7 +93,11 @@ where
             biased;
 
             read_result = reader.read(&mut buf) => {
-                let read = read_result?;
+                let read = match read_result {
+                    Ok(n) => n,
+                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => 0,
+                    Err(err) => return Err(err),
+                };
                 if read == 0 {
                     writer.shutdown().await?;
                     return Ok(total);
@@ -131,7 +147,7 @@ mod tests {
         });
 
         let control_stream = TcpStream::connect(control_addr).await.unwrap();
-        let mut backend_control = BufReader::new(control_stream);
+        let mut backend_control = BufReader::new(BackendStream::Plain(control_stream));
 
         let data_stream = open_backend_data_connection(&mut backend_control)
             .await
@@ -152,7 +168,7 @@ mod tests {
         let accept_backend =
             tokio::spawn(async move { backend_listener.accept().await.unwrap().0 });
         let mut backend_side_b = TcpStream::connect(backend_addr).await.unwrap();
-        let mut backend_data = accept_backend.await.unwrap();
+        let mut backend_data = BackendStream::Plain(accept_backend.await.unwrap());
 
         let relay_task = tokio::spawn(async move {
             relay_bidirectional(&mut client_data, &mut backend_data, Duration::from_secs(5)).await
@@ -190,7 +206,7 @@ mod tests {
         let accept_backend =
             tokio::spawn(async move { backend_listener.accept().await.unwrap().0 });
         let _backend_side_b = TcpStream::connect(backend_addr).await.unwrap();
-        let mut backend_data = accept_backend.await.unwrap();
+        let mut backend_data = BackendStream::Plain(accept_backend.await.unwrap());
 
         // Neither side ever sends anything or closes; the relay must time out rather than
         // hang forever.

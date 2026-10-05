@@ -3,11 +3,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::backend;
 use crate::backend::dns_cache::DnsCache;
+use crate::backend::tls::{self, BackendStream, BackendTlsConnector};
 use crate::config::{BackendConfig, LimitsConfig, PassiveConfig, TimeoutConfig};
 use crate::metrics::Metrics;
 use crate::pasv::port_manager::{PasvPortGuard, PortManager};
@@ -56,11 +57,14 @@ macro_rules! backend_io {
 /// section 4/6): without this, a peer that never sends `\n` could make the gateway buffer an
 /// unbounded amount of memory for a single line. If the cap is hit before a `\n` is found, this
 /// returns an `InvalidData` error rather than continuing to read.
-async fn read_line_bounded(
-    conn: &mut BufReader<TcpStream>,
+async fn read_line_bounded<S>(
+    conn: &mut BufReader<S>,
     line: &mut String,
     max_bytes: usize,
-) -> io::Result<usize> {
+) -> io::Result<usize>
+where
+    S: AsyncRead + Unpin,
+{
     let bytes_read = conn.take(max_bytes as u64).read_line(line).await?;
     if bytes_read == max_bytes && !line.ends_with('\n') {
         return Err(io::Error::new(
@@ -71,12 +75,15 @@ async fn read_line_bounded(
     Ok(bytes_read)
 }
 
-async fn read_line_with_timeout(
-    conn: &mut BufReader<TcpStream>,
+async fn read_line_with_timeout<S>(
+    conn: &mut BufReader<S>,
     line: &mut String,
     timeout: Duration,
     max_bytes: usize,
-) -> io::Result<usize> {
+) -> io::Result<usize>
+where
+    S: AsyncRead + Unpin,
+{
     match tokio::time::timeout(timeout, read_line_bounded(conn, line, max_bytes)).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
@@ -101,7 +108,7 @@ async fn read_line_with_timeout(
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     name = "session",
-    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager, metrics, dns_cache),
+    skip(client, peer_addr, backend_config, passive_config, timeouts, limits, port_manager, metrics, dns_cache, backend_tls),
     fields(
         session_id = session_id,
         client_ip = %peer_addr.ip(),
@@ -120,6 +127,7 @@ pub async fn handle(
     port_manager: PortManager,
     metrics: Arc<Metrics>,
     dns_cache: DnsCache,
+    backend_tls: Option<BackendTlsConnector>,
 ) -> anyhow::Result<()> {
     tracing::info!("session started");
     let _session_guard = metrics.session_started();
@@ -148,7 +156,7 @@ pub async fn handle(
         };
 
     let mut client_conn = BufReader::new(client);
-    let mut backend_conn = BufReader::new(backend_stream);
+    let mut backend_conn = BufReader::new(BackendStream::Plain(backend_stream));
     let mut active_pasv: Option<PasvPortGuard> = None;
 
     // Relay the backend's initial banner to the client as-is.
@@ -169,6 +177,32 @@ pub async fn handle(
             .await;
         return Ok(());
     }
+
+    // Explicit FTPS toward the backend (clients still speak plain FTP to us). Done before the
+    // banner is passed on, so a client never sees a ready banner for a session that can't be
+    // secured. Fails closed: no fallback to plain FTP.
+    if let Some(connector) = &backend_tls {
+        backend_conn = match tls::negotiate_explicit_ftps(
+            backend_conn,
+            connector,
+            &backend_config.host,
+            command_timeout,
+            connection_timeout,
+            max_command_line_bytes,
+        )
+        .await
+        {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to establish TLS with backend");
+                let _ = client_conn
+                    .write_all(b"421 Service not available\r\n")
+                    .await;
+                return Ok(());
+            }
+        };
+    }
+
     client_io!(client_conn.write_all(line.as_bytes()).await);
 
     loop {
@@ -328,14 +362,46 @@ pub async fn handle(
                         }
                         client_io!(client_conn.write_all(backend_reply.as_bytes()).await);
 
+                        if backend_tls.is_some() && !backend_reply.starts_with('1') {
+                            // The backend refused the transfer: its final reply was just
+                            // relayed, nothing more will follow on the control connection, and
+                            // it will never start a TLS handshake on the data connection.
+                            tracing::warn!(%filename_log, reply = %backend_reply.trim_end(), "upload failed");
+                            continue;
+                        }
+
+                        // With backend FTPS the data connection's TLS handshake starts only now,
+                        // after the transfer command (servers do not begin it any earlier).
+                        let backend_data = match &backend_tls {
+                            Some(connector) => tokio::time::timeout(
+                                connection_timeout,
+                                connector.connect(&backend_config.host, channel.backend_data),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "backend data connection TLS handshake timed out",
+                                ))
+                            }),
+                            None => Ok(BackendStream::Plain(channel.backend_data)),
+                        };
+
                         // Move the file bytes only after the backend confirmed it is ready (150).
                         let _upload_guard = metrics.upload_started();
-                        let relay_result = relay::relay_bidirectional(
-                            &mut channel.client_data,
-                            &mut channel.backend_data,
-                            data_idle_timeout,
-                        )
-                        .await;
+                        let relay_result = match backend_data {
+                            Ok(mut backend_data) => {
+                                relay::relay_bidirectional(
+                                    &mut channel.client_data,
+                                    &mut backend_data,
+                                    data_idle_timeout,
+                                )
+                                .await
+                            }
+                            // Handled like a relay failure: the backend's own completion reply
+                            // (read below) is still relayed, keeping the control connection in sync.
+                            Err(err) => Err(err),
+                        };
                         match relay_result {
                             Ok((bytes_uploaded, _)) => {
                                 metrics.add_upload_bytes(bytes_uploaded);

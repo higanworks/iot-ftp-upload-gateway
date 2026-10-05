@@ -10,6 +10,18 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+### Added
+
+- Optional Explicit FTPS (RFC 4217) between the gateway and the backends:
+  `backend_tls.mode: explicit` (`GATEWAY_BACKEND_TLS=explicit`) makes the gateway negotiate
+  `AUTH TLS` / `PBSZ 0` / `PROT P` with each backend, encrypting both the control and data
+  connections, while clients keep speaking plain FTP. Supports a private CA
+  (`backend_tls.ca_file`), a certificate name override (`backend_tls.server_name`), and pinning
+  TLS 1.2 (`backend_tls.max_version`). Data connections resume the control connection's TLS
+  session for backends that require session reuse. Fails closed: a backend that can't complete
+  the negotiation ends the session with `421`, never falling back to plain FTP. Off by default;
+  existing deployments are unaffected.
+
 ## [2026.9.5] - 2026-09-16
 
 ### Changed

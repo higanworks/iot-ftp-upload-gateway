@@ -34,6 +34,7 @@ async fn extra_connection_beyond_the_per_ip_limit_is_rejected() {
             host: backend.addr.ip().to_string(),
             port: backend.addr.port(),
         }],
+        backend_tls: Default::default(),
         timeouts: TimeoutConfig::default(),
         limits: LimitsConfig {
             max_connections_per_ip: 2,

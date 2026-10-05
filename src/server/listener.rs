@@ -8,7 +8,8 @@ use tokio::task::JoinSet;
 
 use crate::backend::dns_cache::DnsCache;
 use crate::backend::selector::BackendSelector;
-use crate::config::Config;
+use crate::backend::tls::BackendTlsConnector;
+use crate::config::{BackendTlsMode, Config};
 use crate::metrics::Metrics;
 use crate::pasv::port_manager::PortManager;
 use crate::shutdown;
@@ -35,6 +36,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let backend_selector = BackendSelector::new(config.backends.clone());
     let ip_limiter = IpConnectionLimiter::new(config.limits.max_connections_per_ip);
     let dns_cache = DnsCache::new();
+    // Built once so every session (control and data connections alike) shares one TLS
+    // session-resumption store; also surfaces a bad `ca_file` at startup.
+    let backend_tls = match config.backend_tls.mode {
+        BackendTlsMode::Off => None,
+        BackendTlsMode::Explicit => Some(BackendTlsConnector::new(&config.backend_tls)?),
+    };
     let metrics = Metrics::new();
     let mut sessions = JoinSet::new();
 
@@ -88,6 +95,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                 let port_manager = port_manager.clone();
                 let metrics = Arc::clone(&metrics);
                 let dns_cache = dns_cache.clone();
+                let backend_tls = backend_tls.clone();
 
                 sessions.spawn(async move {
                     // Held for the whole session so its slot in `ip_limiter` is released
@@ -104,6 +112,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
                         port_manager,
                         metrics,
                         dns_cache,
+                        backend_tls,
                     )
                     .await
                     {

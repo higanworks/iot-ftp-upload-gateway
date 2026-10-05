@@ -1,6 +1,6 @@
 use std::env::VarError;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -13,6 +13,7 @@ pub struct Config {
     pub listen: ListenConfig,
     pub passive: PassiveConfig,
     pub backends: Vec<BackendConfig>,
+    pub backend_tls: BackendTlsConfig,
     pub timeouts: TimeoutConfig,
     pub limits: LimitsConfig,
     pub metrics: MetricsConfig,
@@ -74,6 +75,65 @@ impl Default for PortRange {
 pub struct BackendConfig {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendTlsMode {
+    /// Plain FTP to the backend (the gateway's original behavior).
+    #[default]
+    Off,
+    /// Explicit FTPS (RFC 4217) toward the backend: `AUTH TLS`, `PBSZ 0`, `PROT P`, so both the
+    /// control and data connections are encrypted. Clients still speak plain FTP to the gateway.
+    Explicit,
+}
+
+impl BackendTlsMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "off" => Ok(BackendTlsMode::Off),
+            "explicit" => Ok(BackendTlsMode::Explicit),
+            other => bail!("invalid backend TLS mode '{other}', expected 'off' or 'explicit'"),
+        }
+    }
+}
+
+/// Highest TLS version the gateway will offer the backend.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum BackendTlsMaxVersion {
+    #[serde(rename = "1.2")]
+    V1_2,
+    #[default]
+    #[serde(rename = "1.3")]
+    V1_3,
+}
+
+impl BackendTlsMaxVersion {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "1.2" => Ok(BackendTlsMaxVersion::V1_2),
+            "1.3" => Ok(BackendTlsMaxVersion::V1_3),
+            other => bail!("invalid backend TLS max version '{other}', expected '1.2' or '1.3'"),
+        }
+    }
+}
+
+/// TLS settings applied to every backend (not per-backend). There is deliberately no option to
+/// disable certificate verification: a backend with a private/self-signed CA is supported via
+/// `ca_file` instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct BackendTlsConfig {
+    pub mode: BackendTlsMode,
+    /// PEM file of CA certificate(s) trusted for backend server certificates. When unset, the
+    /// bundled public roots (webpki-roots) are used.
+    pub ca_file: Option<PathBuf>,
+    /// Name used for SNI and certificate verification. Defaults to each backend's `host`; set
+    /// this when the backend is reached via a name its certificate does not cover.
+    pub server_name: Option<String>,
+    /// Highest TLS version offered. Set to `1.2` for backends whose TLS 1.3 session resumption
+    /// does not interoperate with data-connection session reuse.
+    pub max_version: BackendTlsMaxVersion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
@@ -192,6 +252,18 @@ impl Config {
         if let Some(v) = env_var("GATEWAY_BACKENDS")? {
             self.backends = parse_backends(&v)?;
         }
+        if let Some(v) = env_var("GATEWAY_BACKEND_TLS")? {
+            self.backend_tls.mode = BackendTlsMode::parse(&v)?;
+        }
+        if let Some(v) = env_var("GATEWAY_BACKEND_TLS_CA_FILE")? {
+            self.backend_tls.ca_file = Some(PathBuf::from(v));
+        }
+        if let Some(v) = env_var("GATEWAY_BACKEND_TLS_SERVER_NAME")? {
+            self.backend_tls.server_name = Some(v);
+        }
+        if let Some(v) = env_var("GATEWAY_BACKEND_TLS_MAX_VERSION")? {
+            self.backend_tls.max_version = BackendTlsMaxVersion::parse(&v)?;
+        }
         if let Some(v) = env_var("GATEWAY_CONNECTION_TIMEOUT_SECS")? {
             self.timeouts.connection_timeout_secs = v
                 .parse()
@@ -237,6 +309,19 @@ impl Config {
         }
         if self.passive.port_range.start >= self.passive.port_range.end {
             bail!("passive.port_range.start must be less than passive.port_range.end");
+        }
+        if self.backend_tls.mode == BackendTlsMode::Explicit {
+            if let Some(ca_file) = &self.backend_tls.ca_file
+                && !ca_file.is_file()
+            {
+                bail!(
+                    "backend_tls.ca_file '{}' does not exist or is not a file",
+                    ca_file.display()
+                );
+            }
+            if self.backend_tls.server_name.as_deref() == Some("") {
+                bail!("backend_tls.server_name must not be empty");
+            }
         }
         Ok(())
     }
@@ -334,6 +419,91 @@ mod tests {
             end: 10000,
         };
         assert!(config.validate().is_err());
+    }
+
+    fn config_with_backend() -> Config {
+        Config {
+            backends: vec![BackendConfig {
+                host: "ftp01".to_string(),
+                port: 21,
+            }],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn example_config_parses_with_backend_tls_off_and_when_enabled() {
+        let example = include_str!("../config.example.yaml");
+        let as_shipped: Config = serde_yaml::from_str(example).unwrap();
+        assert_eq!(as_shipped.backend_tls.mode, BackendTlsMode::Off);
+
+        // Uncomment only the `backend_tls` block, not the header's env var list.
+        let enabled = [
+            "backend_tls:",
+            "  mode:",
+            "  ca_file:",
+            "  server_name:",
+            "  max_version:",
+        ]
+        .iter()
+        .fold(example.to_string(), |text, line| {
+            text.replace(&format!("#{line}"), line)
+        });
+        let enabled: Config = serde_yaml::from_str(&enabled).unwrap();
+        assert_eq!(enabled.backend_tls.mode, BackendTlsMode::Explicit);
+        assert_eq!(
+            enabled.backend_tls.server_name.as_deref(),
+            Some("ftp.example.com")
+        );
+        assert_eq!(enabled.backend_tls.max_version, BackendTlsMaxVersion::V1_3);
+    }
+
+    #[test]
+    fn backend_tls_defaults_to_off() {
+        assert_eq!(Config::default().backend_tls.mode, BackendTlsMode::Off);
+        assert_eq!(
+            Config::default().backend_tls.max_version,
+            BackendTlsMaxVersion::V1_3
+        );
+    }
+
+    #[test]
+    fn parses_backend_tls_from_yaml() {
+        let config: Config = serde_yaml::from_str(
+            "backend_tls:\n  mode: explicit\n  server_name: ftp.example.com\n  max_version: \"1.2\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.backend_tls.mode, BackendTlsMode::Explicit);
+        assert_eq!(
+            config.backend_tls.server_name.as_deref(),
+            Some("ftp.example.com")
+        );
+        assert_eq!(config.backend_tls.max_version, BackendTlsMaxVersion::V1_2);
+    }
+
+    #[test]
+    fn rejects_unknown_backend_tls_mode_and_version() {
+        assert!(BackendTlsMode::parse("implicit").is_err());
+        assert!(BackendTlsMaxVersion::parse("1.1").is_err());
+        assert_eq!(
+            BackendTlsMode::parse("Explicit").unwrap(),
+            BackendTlsMode::Explicit
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_backend_tls_ca_file() {
+        let mut config = config_with_backend();
+        config.backend_tls.mode = BackendTlsMode::Explicit;
+        config.backend_tls.ca_file = Some(PathBuf::from("/nonexistent/ca.pem"));
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_ignores_backend_tls_ca_file_when_off() {
+        let mut config = config_with_backend();
+        config.backend_tls.ca_file = Some(PathBuf::from("/nonexistent/ca.pem"));
+        assert!(config.validate().is_ok());
     }
 
     #[test]
