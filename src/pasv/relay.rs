@@ -2,7 +2,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use anyhow::{Context, anyhow, bail};
+use anyhow::anyhow;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -10,11 +10,65 @@ use crate::backend::connection::connect_from;
 use crate::backend::tls::BackendStream;
 use crate::protocol::reply::parse_pasv_reply;
 
+/// Why opening a backend data connection failed. The distinction matters to the caller: only one
+/// of the two leaves the backend control connection usable.
+#[derive(Debug)]
+pub enum DataConnectError {
+    /// The backend control connection can no longer be trusted to be in step with our commands:
+    /// the `PASV` reply never came, was cut off, or ran past the line limit. A reply that turns
+    /// up late would be read as the answer to the *next* command, so the session must end.
+    ControlConnection(anyhow::Error),
+    /// The control connection is fine -- the reply was read in full -- but it was not a `PASV`
+    /// address (a refusal such as `425`, say).
+    UnusableReply(anyhow::Error),
+    /// The control connection is fine and the reply gave an address, but connecting to it failed.
+    ConnectFailed(anyhow::Error),
+}
+
+impl std::fmt::Display for DataConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataConnectError::ControlConnection(err)
+            | DataConnectError::UnusableReply(err)
+            | DataConnectError::ConnectFailed(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for DataConnectError {}
+
+impl DataConnectError {
+    /// The underlying I/O error, if there is one -- used to judge whether a failed connect says
+    /// something against the source address it was made from.
+    pub fn io_error(&self) -> Option<&io::Error> {
+        match self {
+            DataConnectError::ControlConnection(err)
+            | DataConnectError::UnusableReply(err)
+            | DataConnectError::ConnectFailed(err) => err.root_cause().downcast_ref::<io::Error>(),
+        }
+    }
+}
+
+/// Limits applied while opening a backend data connection.
+#[derive(Debug, Clone, Copy)]
+pub struct DataConnectLimits {
+    /// How long to wait for the backend's reply to `PASV`.
+    pub reply_timeout: Duration,
+    /// How long to wait for the TCP connection to the data port.
+    pub connect_timeout: Duration,
+    /// Longest `PASV` reply line accepted, so a backend that never sends a newline cannot make
+    /// the gateway buffer without bound.
+    pub max_line_bytes: usize,
+}
+
 /// Asks the backend to open a passive data connection and connects to the address/port
 /// it returns. The Gateway itself acts as a PASV client toward the backend here.
 ///
 /// With `local_ip`, the connection is made from that local address -- the same one the control
 /// connection uses, since backends tie a data connection to its control connection's client IP.
+///
+/// Every wait is bounded by `limits`: a backend that stops answering must not be able to hold the
+/// session (and the PASV port and source-address slot it has claimed) forever.
 ///
 /// This only opens the TCP connection. With backend FTPS the TLS handshake on a data connection
 /// cannot happen here: servers start it only once the transfer command (`STOR`) has been
@@ -22,21 +76,71 @@ use crate::protocol::reply::parse_pasv_reply;
 pub async fn open_backend_data_connection(
     backend_control: &mut BufReader<BackendStream>,
     local_ip: Option<Ipv4Addr>,
-) -> anyhow::Result<TcpStream> {
-    backend_control.write_all(b"PASV\r\n").await?;
+    limits: DataConnectLimits,
+) -> Result<TcpStream, DataConnectError> {
+    let reply = tokio::time::timeout(limits.reply_timeout, async {
+        backend_control.write_all(b"PASV\r\n").await?;
+        let mut line = String::new();
+        let bytes_read = (&mut *backend_control)
+            .take(limits.max_line_bytes as u64)
+            .read_line(&mut line)
+            .await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "backend closed the control connection while opening a data connection",
+            ));
+        }
+        if !line.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "backend's PASV reply exceeds the maximum line length",
+            ));
+        }
+        Ok(line)
+    })
+    .await;
+    let line = match reply {
+        Ok(Ok(line)) => line,
+        Ok(Err(err)) => {
+            return Err(DataConnectError::ControlConnection(
+                anyhow::Error::new(err).context("reading the backend's PASV reply failed"),
+            ));
+        }
+        Err(_) => {
+            return Err(DataConnectError::ControlConnection(anyhow::Error::new(
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the backend's PASV reply",
+                ),
+            )));
+        }
+    };
 
-    let mut line = String::new();
-    let bytes_read = backend_control.read_line(&mut line).await?;
-    if bytes_read == 0 {
-        bail!("backend closed the control connection while opening a data connection");
+    let (ip, port) = parse_pasv_reply(&line).ok_or_else(|| {
+        DataConnectError::UnusableReply(anyhow!(
+            "backend returned an unparsable PASV reply: {line:?}"
+        ))
+    })?;
+
+    match tokio::time::timeout(
+        limits.connect_timeout,
+        connect_from(SocketAddr::from((ip, port)), local_ip),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(err)) => Err(DataConnectError::ConnectFailed(
+            anyhow::Error::new(err).context("failed to connect to backend data port"),
+        )),
+        Err(_) => Err(DataConnectError::ConnectFailed(
+            anyhow::Error::new(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "connecting to the backend data port timed out",
+            ))
+            .context("failed to connect to backend data port"),
+        )),
     }
-
-    let (ip, port) = parse_pasv_reply(&line)
-        .ok_or_else(|| anyhow!("backend returned an unparsable PASV reply: {line:?}"))?;
-
-    connect_from(SocketAddr::from((ip, port)), local_ip)
-        .await
-        .context("failed to connect to backend data port")
 }
 
 /// Relays bytes bidirectionally between the client's data connection and the backend's
@@ -155,7 +259,7 @@ mod tests {
         let control_stream = TcpStream::connect(control_addr).await.unwrap();
         let mut backend_control = BufReader::new(BackendStream::Plain(control_stream));
 
-        let data_stream = open_backend_data_connection(&mut backend_control, None)
+        let data_stream = open_backend_data_connection(&mut backend_control, None, limits())
             .await
             .unwrap();
         assert_eq!(data_stream.peer_addr().unwrap().port(), data_port);
@@ -187,9 +291,10 @@ mod tests {
         let control = TcpStream::connect(control_addr).await.unwrap();
         let mut backend_control = BufReader::new(BackendStream::Plain(control));
 
-        let data = open_backend_data_connection(&mut backend_control, Some(Ipv4Addr::LOCALHOST))
-            .await
-            .unwrap();
+        let data =
+            open_backend_data_connection(&mut backend_control, Some(Ipv4Addr::LOCALHOST), limits())
+                .await
+                .unwrap();
         let (_accepted, peer) = data_listener.accept().await.unwrap();
         assert_eq!(peer.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(data.local_addr().unwrap().ip(), peer.ip());
@@ -202,10 +307,171 @@ mod tests {
         let mut backend_control = BufReader::new(BackendStream::Plain(control));
 
         // TEST-NET-3 (RFC 5737): never assigned to a real interface.
-        let result =
-            open_backend_data_connection(&mut backend_control, Some(Ipv4Addr::new(203, 0, 113, 9)))
-                .await;
+        let result = open_backend_data_connection(
+            &mut backend_control,
+            Some(Ipv4Addr::new(203, 0, 113, 9)),
+            limits(),
+        )
+        .await;
         assert!(result.is_err());
+    }
+
+    fn limits() -> DataConnectLimits {
+        DataConnectLimits {
+            reply_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(5),
+            max_line_bytes: 4096,
+        }
+    }
+
+    /// A control connection to a backend whose behavior is `script`, which gets the backend's
+    /// side of the connection after it has received the `PASV` command.
+    async fn control_with_backend<F, Fut>(script: F) -> BufReader<BackendStream>
+    where
+        F: FnOnce(BufReader<TcpStream>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "PASV\r\n");
+            script(stream).await;
+        });
+        let control = TcpStream::connect(addr).await.unwrap();
+        BufReader::new(BackendStream::Plain(control))
+    }
+
+    fn is_control_error(result: &Result<TcpStream, DataConnectError>) -> bool {
+        matches!(result, Err(DataConnectError::ControlConnection(_)))
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_never_answers_pasv_times_out_as_a_control_connection_failure() {
+        let mut control = control_with_backend(|stream| async move {
+            // Never replies; keep the connection open past the client's timeout.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        })
+        .await;
+        let started = std::time::Instant::now();
+        let result = open_backend_data_connection(
+            &mut control,
+            None,
+            DataConnectLimits {
+                reply_timeout: Duration::from_millis(150),
+                ..limits()
+            },
+        )
+        .await;
+        assert!(is_control_error(&result), "{result:?}");
+        // Reported as a timeout, so the caller can count it as one.
+        let io_kind = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.io_error())
+            .map(|e| e.kind());
+        assert_eq!(io_kind, Some(io::ErrorKind::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn an_overlong_pasv_reply_is_a_control_connection_failure() {
+        let mut control = control_with_backend(|mut stream| async move {
+            // No newline, well past the limit.
+            let _ = stream.write_all(&[b'x'; 5000]).await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        })
+        .await;
+        let result = open_backend_data_connection(
+            &mut control,
+            None,
+            DataConnectLimits {
+                max_line_bytes: 64,
+                ..limits()
+            },
+        )
+        .await;
+        assert!(is_control_error(&result), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn the_backend_closing_the_control_connection_is_a_control_connection_failure() {
+        let mut control = control_with_backend(|stream| async move { drop(stream) }).await;
+        let result = open_backend_data_connection(&mut control, None, limits()).await;
+        assert!(is_control_error(&result), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn a_complete_but_unusable_reply_leaves_the_control_connection_in_step() {
+        let mut control = control_with_backend(|mut stream| async move {
+            stream
+                .write_all(b"425 Can't open data connection\r\n")
+                .await
+                .unwrap();
+            stream.write_all(b"200 next reply\r\n").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        let result = open_backend_data_connection(&mut control, None, limits()).await;
+        assert!(
+            matches!(result, Err(DataConnectError::UnusableReply(_))),
+            "{result:?}"
+        );
+
+        // The 425 was consumed whole, so the next line read is the *next* reply.
+        let mut next = String::new();
+        control.read_line(&mut next).await.unwrap();
+        assert_eq!(next, "200 next reply\r\n");
+    }
+
+    #[tokio::test]
+    async fn failing_to_connect_to_the_announced_data_port_is_only_a_data_connection_failure() {
+        // A port that nothing listens on.
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let mut control = control_with_backend(move |mut stream| async move {
+            let reply = pasv_reply(Ipv4Addr::LOCALHOST, closed_port);
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        let result = open_backend_data_connection(&mut control, None, limits()).await;
+        assert!(
+            matches!(result, Err(DataConnectError::ConnectFailed(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connecting_to_an_unresponsive_data_port_is_bounded_by_the_connect_timeout() {
+        // TEST-NET-1 (RFC 5737) is not routed: the connect either hangs until the timeout or
+        // fails at once, depending on the network; either way it must end quickly.
+        let mut control = control_with_backend(|mut stream| async move {
+            let reply = pasv_reply(Ipv4Addr::new(192, 0, 2, 1), 40000);
+            stream.write_all(reply.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        })
+        .await;
+        let started = std::time::Instant::now();
+        let result = open_backend_data_connection(
+            &mut control,
+            None,
+            DataConnectLimits {
+                connect_timeout: Duration::from_millis(200),
+                ..limits()
+            },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(DataConnectError::ConnectFailed(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[tokio::test]

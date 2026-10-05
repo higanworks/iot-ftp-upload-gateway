@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::backend::rotator::SourceRotator;
 use crate::metrics::Metrics;
 use crate::pasv::port_manager::PortManager;
 
@@ -34,6 +35,7 @@ pub async fn run(
     addr: SocketAddr,
     metrics: Arc<Metrics>,
     port_manager: PortManager,
+    source_rotator: Option<SourceRotator>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!(%addr, "metrics endpoint started");
@@ -48,9 +50,16 @@ pub async fn run(
         };
         let metrics = Arc::clone(&metrics);
         let port_manager = port_manager.clone();
+        let source_rotator = source_rotator.clone();
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_request(stream, &metrics, &port_manager, REQUEST_READ_TIMEOUT).await
+            if let Err(err) = handle_request(
+                stream,
+                &metrics,
+                &port_manager,
+                source_rotator.as_ref(),
+                REQUEST_READ_TIMEOUT,
+            )
+            .await
             {
                 tracing::debug!(error = %err, "metrics request failed");
             }
@@ -79,6 +88,7 @@ async fn handle_request(
     stream: TcpStream,
     metrics: &Metrics,
     port_manager: &PortManager,
+    source_rotator: Option<&SourceRotator>,
     read_timeout: Duration,
 ) -> std::io::Result<()> {
     let mut conn = BufReader::new(stream);
@@ -103,7 +113,12 @@ async fn handle_request(
                 return write_response(&mut conn, "404 Not Found", "text/plain", "").await;
             }
 
-            let body = metrics.render(port_manager.active_count());
+            let rotation = source_rotator.map(SourceRotator::snapshot);
+            let body = metrics.render(
+                port_manager.active_count(),
+                port_manager.capacity(),
+                rotation.as_ref(),
+            );
             write_response(&mut conn, "200 OK", "text/plain; version=0.0.4", &body).await
         }
     }
@@ -202,7 +217,7 @@ mod tests {
         let port_manager = PortManager::new(PortRange { start: 0, end: 0 });
         let handle = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_request(stream, &metrics, &port_manager, read_timeout).await
+            handle_request(stream, &metrics, &port_manager, None, read_timeout).await
         });
         (addr, handle)
     }
@@ -232,6 +247,62 @@ mod tests {
             response.contains("ftp_gateway_sessions_active 0\n"),
             "{response}"
         );
+    }
+
+    #[tokio::test]
+    async fn serves_per_source_metrics_when_source_rotation_is_on() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = Metrics::new();
+        let port_manager = PortManager::new(PortRange {
+            start: 8192,
+            end: 8200,
+        });
+        let source = std::net::Ipv4Addr::new(10, 0, 0, 7);
+        let rotator = SourceRotator::new(vec![source]);
+        // One transfer in flight from `source` to a backend.
+        let _slot = rotator
+            .acquire_data_slot("backend.example:21", 9, source, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_request(
+                stream,
+                &metrics,
+                &port_manager,
+                Some(&rotator),
+                Duration::from_secs(5),
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        handle.await.unwrap().unwrap();
+
+        assert!(
+            response.contains("ftp_gateway_pasv_ports_capacity 9\n"),
+            "{response}"
+        );
+        let series = "{backend=\"backend.example:21\",source=\"10.0.0.7\"}";
+        for expected in [
+            format!("ftp_gateway_backend_source_transfers_active{series} 1\n"),
+            format!("ftp_gateway_backend_source_transfers_capacity{series} 9\n"),
+            format!("ftp_gateway_backend_source_transfers_total{series} 1\n"),
+            format!("ftp_gateway_backend_source_slot_timeouts_total{series} 0\n"),
+            "ftp_gateway_backend_source_unhealthy{source=\"10.0.0.7\"} 0\n".to_string(),
+        ] {
+            assert!(
+                response.contains(&expected),
+                "missing {expected:?} in {response}"
+            );
+        }
     }
 
     #[tokio::test]

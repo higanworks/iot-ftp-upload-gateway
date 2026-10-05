@@ -72,6 +72,12 @@ impl PortManager {
         None
     }
 
+    /// Number of ports in the configured range, for the `ftp_gateway_pasv_ports_capacity`
+    /// metric (`src/metrics.rs`).
+    pub fn capacity(&self) -> usize {
+        self.range.len()
+    }
+
     /// Number of PASV/EPSV ports currently allocated, for the `ftp_gateway_pasv_ports_active`
     /// metric (`src/metrics.rs`).
     pub fn active_count(&self) -> usize {

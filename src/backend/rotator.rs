@@ -49,7 +49,43 @@ struct BackendState {
     /// `sources[advances % sources.len()]`.
     advances: usize,
     started_in_cycle: usize,
-    slots: HashMap<Ipv4Addr, Arc<Semaphore>>,
+    slots: HashMap<Ipv4Addr, SlotState>,
+}
+
+/// Data-transfer accounting for one (backend, source address) pair.
+struct SlotState {
+    semaphore: Arc<Semaphore>,
+    capacity: usize,
+    /// Transfers started from this source, ever. Saturating, like the `Metrics` counters.
+    started_total: u64,
+    /// Times a transfer gave up waiting for a free slot on this source.
+    slot_timeouts_total: u64,
+}
+
+/// A point-in-time view of the rotator, for the `/metrics` endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RotatorSnapshot {
+    /// Every source address and whether it is currently left out of the rotation.
+    pub sources: Vec<SourceHealth>,
+    /// Per (backend, source address) transfer accounting, for the pairs used so far.
+    pub transfers: Vec<SourceTransferStat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceHealth {
+    pub source: Ipv4Addr,
+    pub unhealthy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTransferStat {
+    pub backend: String,
+    pub source: Ipv4Addr,
+    pub capacity: usize,
+    /// Data transfers in flight from this source to this backend right now.
+    pub active: usize,
+    pub started_total: u64,
+    pub slot_timeouts_total: u64,
 }
 
 /// One in-flight data transfer's claim on its (backend, source address) capacity. Dropping it
@@ -213,19 +249,39 @@ impl SourceRotator {
             let mut state = self.state.lock().unwrap();
             let backend_state = state.backends.entry(backend.to_string()).or_default();
             Arc::clone(
-                backend_state
+                &backend_state
                     .slots
                     .entry(source)
-                    .or_insert_with(|| Arc::new(Semaphore::new(capacity))),
+                    .or_insert_with(|| SlotState {
+                        semaphore: Arc::new(Semaphore::new(capacity)),
+                        capacity,
+                        started_total: 0,
+                        slot_timeouts_total: 0,
+                    })
+                    .semaphore,
             )
         };
-        let permit = tokio::time::timeout(wait, semaphore.acquire_owned())
-            .await
-            .ok()?
-            .ok()?;
+        let permit = match tokio::time::timeout(wait, semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_closed)) => return None,
+            Err(_elapsed) => {
+                let mut state = self.state.lock().unwrap();
+                if let Some(slot) = state
+                    .backends
+                    .get_mut(backend)
+                    .and_then(|b| b.slots.get_mut(&source))
+                {
+                    slot.slot_timeouts_total = slot.slot_timeouts_total.saturating_add(1);
+                }
+                return None;
+            }
+        };
 
         let mut state = self.state.lock().unwrap();
         let backend_state = state.backends.entry(backend.to_string()).or_default();
+        if let Some(slot) = backend_state.slots.get_mut(&source) {
+            slot.started_total = slot.started_total.saturating_add(1);
+        }
         backend_state.started_in_cycle += 1;
         if backend_state.started_in_cycle >= capacity {
             backend_state.started_in_cycle = 0;
@@ -236,6 +292,47 @@ impl SourceRotator {
             );
         }
         Some(DataSlot { _permit: permit })
+    }
+}
+
+impl SourceRotator {
+    /// A snapshot of every source's health and of the transfer accounting per (backend, source),
+    /// sorted so the `/metrics` output is stable from one scrape to the next.
+    pub fn snapshot(&self) -> RotatorSnapshot {
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> RotatorSnapshot {
+        let state = self.state.lock().unwrap();
+        let sources = state
+            .sources
+            .iter()
+            .map(|&source| SourceHealth {
+                source,
+                unhealthy: state.is_unhealthy(source, now),
+            })
+            .collect();
+        let mut transfers: Vec<SourceTransferStat> = state
+            .backends
+            .iter()
+            .flat_map(|(backend, backend_state)| {
+                backend_state
+                    .slots
+                    .iter()
+                    .map(move |(source, slot)| SourceTransferStat {
+                        backend: backend.clone(),
+                        source: *source,
+                        capacity: slot.capacity,
+                        active: slot
+                            .capacity
+                            .saturating_sub(slot.semaphore.available_permits()),
+                        started_total: slot.started_total,
+                        slot_timeouts_total: slot.slot_timeouts_total,
+                    })
+            })
+            .collect();
+        transfers.sort_by(|a, b| (&a.backend, a.source).cmp(&(&b.backend, b.source)));
+        RotatorSnapshot { sources, transfers }
     }
 }
 
@@ -432,6 +529,72 @@ mod tests {
         // ip(1) was removed, so if it comes back it starts out healthy.
         assert!(rotator.set_sources(vec![ip(1), ip(2), ip(3)]));
         assert_eq!(rotator.candidates(BACKEND), [ip(1), ip(2), ip(3)]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_reports_transfers_in_flight_and_totals_per_backend_and_source() {
+        let rotator = rotator(&[1, 2]);
+        assert_eq!(rotator.snapshot().transfers, []);
+
+        let held = slot(&rotator, "b:21", 2, 1).await;
+        let _also_held = slot(&rotator, "b:21", 2, 1).await;
+        // The source is full: this waits out and is counted as a slot timeout.
+        assert!(
+            rotator
+                .acquire_data_slot("b:21", 2, ip(1), Duration::from_millis(30))
+                .await
+                .is_none()
+        );
+        drop(slot(&rotator, "a:21", 2, 2).await);
+
+        let snapshot = rotator.snapshot();
+        assert_eq!(
+            snapshot.transfers,
+            [
+                SourceTransferStat {
+                    backend: "a:21".to_string(),
+                    source: ip(2),
+                    capacity: 2,
+                    active: 0,
+                    started_total: 1,
+                    slot_timeouts_total: 0,
+                },
+                SourceTransferStat {
+                    backend: "b:21".to_string(),
+                    source: ip(1),
+                    capacity: 2,
+                    active: 2,
+                    started_total: 2,
+                    slot_timeouts_total: 1,
+                },
+            ]
+        );
+
+        drop(held);
+        assert_eq!(rotator.snapshot().transfers[1].active, 1);
+    }
+
+    #[test]
+    fn snapshot_marks_unhealthy_sources_until_they_recover() {
+        let rotator = rotator(&[1, 2]);
+        let now = Instant::now();
+        rotator.mark_unhealthy_at(ip(2), now);
+
+        let health = |snapshot: RotatorSnapshot| -> Vec<(Ipv4Addr, bool)> {
+            snapshot
+                .sources
+                .iter()
+                .map(|s| (s.source, s.unhealthy))
+                .collect()
+        };
+        assert_eq!(
+            health(rotator.snapshot_at(now)),
+            [(ip(1), false), (ip(2), true)]
+        );
+        assert_eq!(
+            health(rotator.snapshot_at(now + UNHEALTHY_FOR)),
+            [(ip(1), false), (ip(2), false)]
+        );
     }
 
     struct FixedInterfaces(Vec<InterfaceAddr>);

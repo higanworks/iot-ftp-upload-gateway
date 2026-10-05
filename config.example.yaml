@@ -12,6 +12,7 @@
 #                                     backend's data port range, default 8192:8200)
 #   GATEWAY_CONNECTION_TIMEOUT_SECS
 #   GATEWAY_IDLE_TIMEOUT_SECS
+#   GATEWAY_REQUIRE_DATA_IP_MATCH    ("true" or "false")
 #   GATEWAY_BACKEND_TLS              ("off" or "explicit")
 #   GATEWAY_BACKEND_TLS_CA_FILE
 #   GATEWAY_BACKEND_TLS_SERVER_NAME
@@ -68,3 +69,12 @@ backends:
 timeouts:
   connection_timeout_secs: 10
   idle_timeout_secs: 300
+
+limits:
+  # Only accept a client's data connection from the same IP address as its control connection
+  # (default true). The PASV port is open to the whole network until the client connects, so
+  # without this a host that reached it first would have its bytes uploaded under the real
+  # client's filename. Set to false only for devices whose control and data connections leave
+  # from different addresses (some carrier-grade NAT pools); it does nothing behind a load
+  # balancer that doesn't preserve the client IP. See README, "Run".
+  require_data_ip_match: true
