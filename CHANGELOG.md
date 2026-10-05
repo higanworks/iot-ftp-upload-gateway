@@ -10,6 +10,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.10.0] - 2026-10-06
+
 ### Added
 
 - Optional Explicit FTPS (RFC 4217) between the gateway and the backends:
@@ -149,7 +151,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.5...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.0...HEAD
+[2026.10.0]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.5...v2026.10.0
 [2026.9.5]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.4...v2026.9.5
 [2026.9.4]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.3...v2026.9.4
 [2026.9.3]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.2...v2026.9.3
