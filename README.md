@@ -39,7 +39,7 @@ flowchart LR
     device1 -- "plain FTP<br/>control + PASV data" --> gw
     device2 -- "plain FTP" --> gw
     deviceN -- "plain FTP" --> gw
-    gw -- "STOR only, round-robin<br/>plain FTP" --> b1
+    gw -- "STOR only, round-robin<br/>plain FTP, or Explicit FTPS (TLS)<br/>with backend_tls" --> b1
     gw -.-> b2
     gw -.-> b3
 ```
@@ -48,6 +48,15 @@ A session's control connection and its PASV data connection always land on the s
 backend (picked round-robin when the session starts), so a client's upload is never split
 across backends. See [Operational notes](#operational-notes) for how this behaves across
 multiple gateway instances.
+
+Devices always speak plain FTP to the gateway. The gateway-to-backend leg is plain FTP by
+default, or Explicit FTPS (control and data connections both encrypted) when
+[`backend_tls`](#backend-ftps) is enabled — so the hop that crosses the network you don't
+control can be encrypted without touching the devices. For backends that serve data connections
+from a very small port range, such as AWS Transfer Family, the gateway can also spread its
+backend connections over several local addresses
+([`backend_source`](#backend-source-rotation)); that setup is described in
+[Using AWS Transfer Family as the backend](#using-aws-transfer-family-as-the-backend).
 
 ## Scope
 
@@ -273,8 +282,8 @@ backend_source:
   it wastes a connect attempt (up to `connection_timeout_secs`) on each session that tries it.
 - **No NAT or load balancer between the gateway and the backend.** The backend must see each
   source address as the client IP; behind a NAT every source looks the same and the extra
-  capacity is lost. (AWS notes Transfer Family cannot recognize the client IP behind an NLB or
-  NAT.)
+  capacity is lost. For AWS Transfer Family this is also AWS's own guidance — see
+  [Endpoint placement](#endpoint-placement-no-nlb-no-nat).
 
 Check the interfaces the gateway chose in its startup log (`backend source address rotation
 enabled`, listing the addresses). Each session's log lines carry a `source_ip` field, and a
@@ -282,6 +291,150 @@ enabled`, listing the addresses). Each session's log lines carry a `source_ip` f
 
 Whether Transfer Family really limits data ports per client IP, and so whether extra source
 addresses raise your concurrency, should be verified against your own endpoint.
+
+## Using AWS Transfer Family as the backend
+
+AWS Transfer Family's FTP/FTPS endpoints differ from a self-hosted FTP server in several ways
+that matter here, and this gateway has settings for the ones it can help with. The gateway is the
+FTP client of the endpoint, so everything below is about its connections *to* Transfer Family;
+devices are unaffected.
+
+### Endpoint placement: no NLB, no NAT
+
+FTP and FTPS servers on Transfer Family can only be created inside a VPC — there is no public
+endpoint for them
+([AWS docs](https://docs.aws.amazon.com/transfer/latest/userguide/infrastructure-security.html#nlb-considerations)).
+A common workaround is to put a Network Load Balancer (NLB) in front of the server, but **AWS
+recommends against that for FTP and FTPS**: an NLB in the path increases costs and reduces the
+number of simultaneous connections the server accepts
+([Working with Network Load Balancers](https://docs.aws.amazon.com/transfer/latest/userguide/working-with-nlb.html)).
+
+The reason is that the server only sees the address of the NLB or NAT gateway, not the real
+client. AWS documents that Transfer Family *uses the source IP address to shard connections
+across its data plane*, so for FTPS a server with an NLB or NAT gateway in the path is limited to
+about **300 simultaneous connections instead of 10,000**, and you can no longer audit who is
+connecting
+([Avoid placing NLBs and NATs in front of AWS Transfer Family servers](https://docs.aws.amazon.com/transfer/latest/userguide/infrastructure-security.html#nlb-considerations)).
+AWS's recommended alternative is a VPC endpoint with an Elastic IP address.
+
+What that means for this gateway:
+
+- Connect the gateway to the endpoint **directly**: same VPC, or a routed path such as peering,
+  Transit Gateway, VPN or Direct Connect that does not translate addresses. A NAT gateway between
+  them makes every gateway connection come from one address, which both hits the lower connection
+  limit and defeats [source rotation](#backend-source-rotation).
+- This applies to the path *between the gateway and Transfer Family* only. Putting an NLB in
+  front of the **gateway** — which is what this project exists to allow for devices — is a
+  different hop and unaffected.
+- With direct connections, the gateway's own source addresses are what Transfer Family shards
+  on, which is why using several of them helps (next section).
+
+### The PASV problem: nine data ports
+
+An FTP upload needs a data connection, and in passive mode the *server* chooses its port and
+announces it in the `PASV` reply. Transfer Family announces ports from a fixed range of
+**8192–8200 — nine ports**
+([AWS docs](https://docs.aws.amazon.com/transfer/latest/userguide/create-server-ftps.html)).
+Consequences for a gateway that funnels many devices into one place:
+
+- Every in-flight upload occupies one of those nine ports. If the capacity is per client IP — a
+  plausible reading, given that AWS shards connections by source IP (see above) and says the
+  endpoint's security group should allow the range *from the client IP CIDR ranges*, but
+  **not stated outright in the docs, so verify it against your endpoint** — then a gateway
+  connecting from a single address can have about nine uploads in flight to that endpoint, no
+  matter how many devices are connected to it.
+- The gateway cannot pick the port or widen the range: the port arrives in the backend's reply.
+  Without `backend_source` (the default) it also does not limit concurrency, so what happens to
+  a burst of uploads beyond the capacity is decided by the backend (expect refused or failed
+  transfers).
+- The way to raise the ceiling is more client addresses: with *N* source addresses the capacity
+  is roughly *N* × 9. That is what `backend_source` does — it connects from each local address
+  in turn, keeps a session on one address (control and data connections must share the client
+  IP), and limits each address to the nine transfers the backend can serve it, making extra
+  uploads wait briefly (and then get `425`) instead of failing at the backend. See
+  [Backend source rotation](#backend-source-rotation) for the mechanics.
+
+### FTPS requirements
+
+Transfer Family's FTPS endpoints require the data channel to be protected (`PROT P`; `PROT C` is
+not supported), and by default enforce **TLS session resumption** on data connections: a data
+connection that doesn't resume the control connection's TLS session is refused with
+`522 data connection must use cached TLS session`
+([ProtocolDetails](https://docs.aws.amazon.com/transfer/latest/userguide/API_ProtocolDetails.html)).
+That is the case [`backend_tls`](#backend-ftps) is built for: the gateway negotiates
+`AUTH TLS` / `PBSZ 0` / `PROT P` itself, and every connection shares one TLS client
+configuration so data connections try to resume. If your endpoint presents a certificate for a
+custom hostname rather than the one you connect to, set `backend_tls.server_name`; use
+`ca_file` if it is signed by a private CA. If resumption fails against your endpoint with TLS 1.3,
+try `max_version: "1.2"`.
+
+### Several network interfaces on the EC2 instance
+
+To give the gateway several source addresses on EC2, attach extra network interfaces (ENIs) to
+the instance — or add secondary private IPs — and run the container with `network_mode: host`,
+so it sees every address and can bind its outgoing connections to each:
+
+```mermaid
+flowchart LR
+    devices["IoT devices<br/>plain FTP"] --> gw
+
+    subgraph ec2["EC2 instance — docker, network_mode: host"]
+        gw["iot-ftp-upload-gateway<br/>backend_tls + backend_source"]
+        eni1["ENI 1 (primary)<br/>10.0.1.10"]
+        eni2["ENI 2<br/>10.0.2.20"]
+        eni3["ENI 3<br/>10.0.3.30"]
+        gw --> eni1
+        gw --> eni2
+        gw --> eni3
+    end
+
+    subgraph vpc["VPC"]
+        tf["AWS Transfer Family endpoint<br/>control :21, data :8192-8200"]
+    end
+
+    eni1 -- "Explicit FTPS, source 10.0.1.10" --> tf
+    eni2 -- "Explicit FTPS, source 10.0.2.20" --> tf
+    eni3 -- "Explicit FTPS, source 10.0.3.30" --> tf
+```
+
+Here three source addresses give about 3 × 9 = 27 concurrent uploads, instead of 9. Setting it
+up:
+
+1. **Attach the interfaces.** The number of ENIs and of IPs per ENI an instance can have depends
+   on its instance type. Each address becomes one source; a secondary IP on an existing ENI works
+   the same way as an extra ENI.
+2. **Route each extra ENI's traffic out of that ENI.** Linux sends everything out of the default
+   route's interface, and AWS drops a packet whose source address doesn't belong to the ENI it
+   leaves through, so each additional ENI needs source-based routing (see the example under
+   [Backend source rotation](#backend-source-rotation)). Secondary IPs on the primary ENI
+   normally don't.
+3. **Keep NAT and load balancers out of the path.** Transfer Family has to see each source
+   address as the client IP; behind a NAT every connection looks like it comes from one address,
+   and the extra capacity disappears. AWS recommends the same for FTP/FTPS (see
+   [Endpoint placement](#endpoint-placement-no-nlb-no-nat)).
+4. **Open the endpoint's security group** for port 21 and 8192–8200 from every source address
+   (or their subnets), in addition to whatever you allow for devices to reach the gateway itself.
+5. **Configure the gateway**, listing the interfaces to use so Docker's own interfaces and
+   anything else on the host are never picked up:
+
+   ```yaml
+   services:
+     gateway:
+       image: ghcr.io/higanworks/iot-ftp-upload-gateway:latest # pin a version tag in production
+       network_mode: host
+       environment:
+         GATEWAY_BACKENDS: "s-0123456789abcdef0.server.transfer.us-east-1.amazonaws.com:21@8192:8200"
+         GATEWAY_PASSIVE_ADDRESS: "<address devices can reach>"
+         GATEWAY_BACKEND_TLS: "explicit"
+         GATEWAY_BACKEND_SOURCE: "rotate"
+         GATEWAY_BACKEND_SOURCE_INCLUDE: "ens5,ens6,ens7"
+   ```
+
+6. **Check it.** At startup the log lists the chosen source addresses (`backend source address
+   rotation enabled`); during use, each session's log lines carry a `source_ip` field. A source
+   that can't connect is logged at `WARN` and skipped for a minute. Verify with a load test that
+   concurrent uploads really exceed nine, since the per-client-IP behavior of your endpoint is
+   the assumption all of this rests on.
 
 ## Docker
 
