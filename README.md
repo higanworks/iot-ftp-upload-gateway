@@ -287,8 +287,12 @@ backends:
     passive_ports: "8192:8200"   # AWS Transfer Family's data ports (the default)
 backend_source:
   mode: rotate
-  include_interfaces: [ens5, ens6]
+  include_interfaces: [ens5, ens6]   # optional: omit to auto-detect (see "Sources" above)
 ```
+
+On a typical EC2 host, `mode: rotate` on its own is usually enough: auto-detection already skips
+loopback, link-local and Docker's interfaces and keeps the instance's real addresses.
+`include_interfaces` is for pinning the choice explicitly.
 
 **What the host must provide** (not something the gateway can set up):
 
@@ -441,8 +445,12 @@ up:
    [Endpoint placement](#endpoint-placement-no-nlb-no-nat)).
 4. **Open the endpoint's security group** for port 21 and 8192–8200 from every source address
    (or their subnets), in addition to whatever you allow for devices to reach the gateway itself.
-5. **Configure the gateway**, listing the interfaces to use so Docker's own interfaces and
-   anything else on the host are never picked up:
+5. **Configure the gateway.** Interface names are normally **not** needed: with
+   `GATEWAY_BACKEND_SOURCE=rotate` alone, auto-detection uses every IPv4 address on the host
+   except loopback, link-local, and virtual interfaces (`lo`, `docker*`, `br-*`, `veth*`, ...),
+   which on an EC2 host running Docker leaves the instance's own ENI addresses (`ens5`, `ens6`,
+   ... on current instance types). New ENIs are picked up automatically as well (re-listed every
+   30 seconds).
 
    ```yaml
    services:
@@ -454,8 +462,16 @@ up:
          GATEWAY_PASSIVE_ADDRESS: "<address devices can reach>"
          GATEWAY_BACKEND_TLS: "explicit"
          GATEWAY_BACKEND_SOURCE: "rotate"
-         GATEWAY_BACKEND_SOURCE_INCLUDE: "ens5,ens6,ens7"
+         # Optional -- only to pin the interfaces instead of auto-detecting them:
+         # GATEWAY_BACKEND_SOURCE_INCLUDE: "ens5,ens6,ens7"
    ```
+
+   Pin them with `GATEWAY_BACKEND_SOURCE_INCLUDE` (wildcards such as `ens*` work) when the host
+   also has real interfaces that must not be used toward the backend — a VPN, a management
+   network, an ENI that has no routing to the endpoint — or when you want the set of sources to
+   stay fixed regardless of what is attached later. `GATEWAY_BACKEND_SOURCE_EXCLUDE` removes
+   individual interfaces from the auto-detected set instead. Either way, the startup log shows
+   which addresses were chosen (step 6).
 
 6. **Check it.** At startup the log lists the chosen source addresses (`backend source address
    rotation enabled`); during use, each session's log lines carry a `source_ip` field. A source
