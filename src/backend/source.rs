@@ -77,7 +77,7 @@ pub fn select_sources(addrs: &[InterfaceAddr], config: &BackendSourceConfig) -> 
                     && !addr.ip.is_link_local()
                     && !BUILT_IN_VIRTUAL_INTERFACES
                         .iter()
-                        .any(|pattern| glob_match(pattern, &addr.interface))
+                        .any(|pattern| matches_name(pattern, &addr.interface))
             }
         })
         .filter(|addr| !matches_any(&config.exclude_interfaces, &addr.interface))
@@ -99,7 +99,22 @@ pub fn resolve_sources(
 fn matches_any(patterns: &[String], name: &str) -> bool {
     patterns
         .iter()
-        .any(|pattern| glob_match(pattern.trim(), name))
+        .any(|pattern| matches_name(pattern.trim(), name))
+}
+
+/// Whether `pattern` matches the interface `name` an address is reported under, or the interface
+/// that name is an alias of.
+///
+/// Linux reports a labeled alias -- `ip addr add ... label ens5:1`, or a legacy `ifcfg-ens5:1`
+/// secondary address, both common ways of putting an EC2 secondary private IP on an ENI -- under
+/// the label, `ens5:1`, although the address is on `ens5`. Matching the part before the colon as
+/// well means `include_interfaces: [ens5]` covers every address on `ens5`, labeled or not, while
+/// a pattern naming the alias itself (`ens5:1`, or `ens5:*`) still singles that one out.
+fn matches_name(pattern: &str, name: &str) -> bool {
+    glob_match(pattern, name)
+        || name
+            .split_once(':')
+            .is_some_and(|(interface, _alias)| glob_match(pattern, interface))
 }
 
 /// Matches `text` against `pattern`, where `*` is any run of characters (including none) and `?`
@@ -230,6 +245,82 @@ mod tests {
             sources,
             [ip(10, 0, 1, 10), ip(10, 0, 1, 11), ip(10, 0, 1, 12)]
         );
+    }
+
+    /// An EC2 instance with one ENI carrying its primary address plus secondary private IPs, some
+    /// of them configured as labeled aliases (`ens5:1`) and some unlabeled.
+    fn single_eni_with_secondary_ips() -> Vec<InterfaceAddr> {
+        vec![
+            addr("lo", [127, 0, 0, 1]),
+            addr("ens5", [10, 0, 1, 10]),
+            addr("ens5", [10, 0, 1, 11]),
+            addr("ens5:1", [10, 0, 1, 12]),
+            addr("ens5:2", [10, 0, 1, 13]),
+            addr("docker0", [172, 17, 0, 1]),
+        ]
+    }
+
+    #[test]
+    fn auto_detection_uses_every_address_on_one_eni_labeled_or_not_in_ascending_order() {
+        let sources = select_sources(&single_eni_with_secondary_ips(), &config(&[], &[]));
+        assert_eq!(
+            sources,
+            [
+                ip(10, 0, 1, 10),
+                ip(10, 0, 1, 11),
+                ip(10, 0, 1, 12),
+                ip(10, 0, 1, 13)
+            ]
+        );
+    }
+
+    #[test]
+    fn including_an_interface_includes_its_labeled_aliases() {
+        let sources = select_sources(&single_eni_with_secondary_ips(), &config(&["ens5"], &[]));
+        assert_eq!(
+            sources,
+            [
+                ip(10, 0, 1, 10),
+                ip(10, 0, 1, 11),
+                ip(10, 0, 1, 12),
+                ip(10, 0, 1, 13)
+            ]
+        );
+    }
+
+    #[test]
+    fn excluding_an_interface_excludes_its_labeled_aliases() {
+        let sources = select_sources(&single_eni_with_secondary_ips(), &config(&[], &["ens5"]));
+        assert!(sources.is_empty());
+    }
+
+    #[test]
+    fn a_pattern_naming_an_alias_singles_out_just_that_alias() {
+        let host = single_eni_with_secondary_ips();
+        assert_eq!(
+            select_sources(&host, &config(&["ens5:1"], &[])),
+            [ip(10, 0, 1, 12)]
+        );
+        assert_eq!(
+            select_sources(&host, &config(&["ens5:*"], &[])),
+            [ip(10, 0, 1, 12), ip(10, 0, 1, 13)]
+        );
+        // Excluding one alias leaves the rest of the ENI in use.
+        assert_eq!(
+            select_sources(&host, &config(&[], &["ens5:2"])),
+            [ip(10, 0, 1, 10), ip(10, 0, 1, 11), ip(10, 0, 1, 12)]
+        );
+    }
+
+    #[test]
+    fn aliases_of_virtual_interfaces_are_virtual_too() {
+        let host = vec![
+            addr("docker0:1", [172, 17, 0, 5]),
+            addr("lo:1", [127, 0, 1, 1]),
+            addr("veth0a1b2c3:1", [10, 99, 0, 1]),
+            addr("ens5", [10, 0, 1, 10]),
+        ];
+        assert_eq!(select_sources(&host, &config(&[], &[])), [ip(10, 0, 1, 10)]);
     }
 
     #[test]
