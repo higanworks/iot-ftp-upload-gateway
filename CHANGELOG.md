@@ -12,6 +12,15 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ### Fixed
 
+- With `backend_tls`, every session shared one TLS resumption store, so a data connection could
+  resume a ticket another session's control connection had left there, and a new session's
+  control connection would resume a stranger's session. Backends that require a data connection
+  to resume *its own* control connection's session (vsftpd's `require_ssl_reuse`, for one) could
+  refuse such a transfer. Each session now has a resumption store of its own, shared only by its
+  control and data connections and dropped with the session. A session can make many uploads on
+  one store (tested with a dozen in a row on TLS 1.3 and 1.2); if a backend sends too few TLS 1.3
+  tickets for that, `backend_tls.max_version: "1.2"` avoids the limit.
+
 - With `backend_source` rotation, an address the OS reports under an alias label (`ens5:1`, as
   produced by `ip addr add ... label ens5:1` or a legacy `ifcfg-ens5:1` secondary-IP alias) was
   not matched by `include_interfaces: [ens5]`, and `exclude_interfaces: [ens5]` did not drop

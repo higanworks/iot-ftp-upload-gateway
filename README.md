@@ -245,9 +245,14 @@ of these commands (a client-sent `AUTH` is still rejected with `502`).
   certificates) replaces the bundled public CA roots, for a private CA. A bad `ca_file` is a
   startup error.
 - **Session reuse.** Many FTPS servers (e.g. vsftpd's default `require_ssl_reuse=YES`) only accept
-  a data connection that resumes the control connection's TLS session. The gateway shares one TLS
-  client configuration across all connections so data connections attempt to resume it. If a
-  backend rejects data connections under TLS 1.3, try `max_version: "1.2"`. Confirm resumption
+  a data connection that resumes the control connection's TLS session. Each FTP session gets a
+  TLS resumption store of its own, shared by that session's control and data connections and by
+  nothing else, so a data connection resumes *its own* control connection's session — never one
+  left behind by another client's session. (TLS 1.3 tickets are single-use; the gateway keeps the
+  new ones the backend sends on every connection of the session, so a session can make many
+  uploads — verified with a dozen in a row on both TLS 1.3 and 1.2 against a rustls server, not
+  against your backend.) If a backend rejects data connections under TLS 1.3, try
+  `max_version: "1.2"`, whose sessions can be reused any number of times. Confirm resumption
   works against your actual backend before relying on it.
 - **Data connection handshake.** As servers expect, the data connection's TLS handshake happens
   after `STOR` is sent and answered with `150`, not when the data connection is opened.
@@ -412,8 +417,9 @@ connection that doesn't resume the control connection's TLS session is refused w
 `522 data connection must use cached TLS session`
 ([ProtocolDetails](https://docs.aws.amazon.com/transfer/latest/userguide/API_ProtocolDetails.html)).
 That is the case [`backend_tls`](#backend-ftps) is built for: the gateway negotiates
-`AUTH TLS` / `PBSZ 0` / `PROT P` itself, and every connection shares one TLS client
-configuration so data connections try to resume. If your endpoint presents a certificate for a
+`AUTH TLS` / `PBSZ 0` / `PROT P` itself, and each session's control and data connections share a
+TLS resumption store of their own so that data connections resume that session's control
+connection. If your endpoint presents a certificate for a
 custom hostname rather than the one you connect to, set `backend_tls.server_name`; use
 `ca_file` if it is signed by a private CA. If resumption fails against your endpoint with TLS 1.3,
 try `max_version: "1.2"`.

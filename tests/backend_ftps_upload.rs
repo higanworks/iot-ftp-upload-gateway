@@ -19,6 +19,7 @@ use iot_ftp_upload_gateway::server::session;
 use rustls::HandshakeKind;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Default)]
 struct Observed {
@@ -26,10 +27,13 @@ struct Observed {
     uploads: Vec<(String, Vec<u8>)>,
     /// How each data connection's TLS handshake was performed.
     data_handshakes: Vec<HandshakeKind>,
+    /// How each control connection's TLS handshake was performed.
+    control_handshakes: Vec<HandshakeKind>,
 }
 
 type SharedObserved = Arc<Mutex<Observed>>;
 
+#[derive(Clone, Copy)]
 struct MockOptions {
     /// Close the data connection with a bare TCP close instead of a TLS `close_notify`.
     skip_close_notify: bool,
@@ -43,7 +47,27 @@ async fn spawn_ftps_backend(pki: &TestPki, options: MockOptions) -> (SocketAddr,
 
     let shared = observed.clone();
     tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
+        while let Ok((tcp, _)) = listener.accept().await {
+            tokio::spawn(serve_control(
+                tcp,
+                acceptor.clone(),
+                shared.clone(),
+                options,
+            ));
+        }
+    });
+    (addr, observed)
+}
+
+/// One control connection of the mock backend. Like vsftpd with `require_ssl_reuse`, it refuses a
+/// data connection that does not resume a TLS session.
+async fn serve_control(
+    tcp: TcpStream,
+    acceptor: TlsAcceptor,
+    shared: SharedObserved,
+    options: MockOptions,
+) {
+    {
         let mut plain = BufReader::new(tcp);
         plain.write_all(b"220 Mock FTPS backend\r\n").await.unwrap();
         let mut line = String::new();
@@ -51,7 +75,13 @@ async fn spawn_ftps_backend(pki: &TestPki, options: MockOptions) -> (SocketAddr,
         assert_eq!(line.trim_end(), "AUTH TLS");
         plain.write_all(b"234 AUTH TLS ok\r\n").await.unwrap();
 
-        let mut conn = BufReader::new(acceptor.accept(plain.into_inner()).await.unwrap());
+        let control_tls = acceptor.accept(plain.into_inner()).await.unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .control_handshakes
+            .push(control_tls.get_ref().1.handshake_kind().unwrap());
+        let mut conn = BufReader::new(control_tls);
         let mut pending_data: Option<TcpListener> = None;
         loop {
             line.clear();
@@ -116,8 +146,7 @@ async fn spawn_ftps_backend(pki: &TestPki, options: MockOptions) -> (SocketAddr,
                 _ => conn.write_all(b"500 unknown\r\n").await.unwrap(),
             }
         }
-    });
-    (addr, observed)
+    }
 }
 
 /// Hands one incoming client connection to the real `session::handle`, with backend TLS on.
@@ -161,6 +190,57 @@ async fn spawn_session(
         .unwrap();
     });
     gateway_addr
+}
+
+/// Like `spawn_session`, but serves every client that connects, as `listener::run` does: all
+/// sessions get a clone of the one connector built at startup.
+async fn spawn_gateway(
+    backend: SocketAddr,
+    connector: iot_ftp_upload_gateway::backend::tls::BackendTlsConnector,
+    port_range: PortRange,
+) -> SocketAddr {
+    let backend_config = BackendConfig {
+        host: backend.ip().to_string(),
+        port: backend.port(),
+        ..Default::default()
+    };
+    let passive_config = PassiveConfig {
+        address: Ipv4Addr::LOCALHOST,
+        port_range,
+    };
+    let port_manager = PortManager::new(port_range);
+    let dns_cache = DnsCache::new();
+    let metrics = iot_ftp_upload_gateway::metrics::Metrics::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut session_id = 0;
+        while let Ok((stream, peer_addr)) = listener.accept().await {
+            session_id += 1;
+            let (backend_config, connector) = (backend_config.clone(), connector.clone());
+            let (port_manager, dns_cache) = (port_manager.clone(), dns_cache.clone());
+            let metrics = metrics.clone();
+            tokio::spawn(async move {
+                let _ = session::handle(
+                    stream,
+                    peer_addr,
+                    session_id,
+                    backend_config,
+                    passive_config,
+                    TimeoutConfig::default(),
+                    LimitsConfig::default(),
+                    port_manager,
+                    metrics,
+                    dns_cache,
+                    Some(connector),
+                    None,
+                )
+                .await;
+            });
+        }
+    });
+    addr
 }
 
 async fn upload_through_gateway(
@@ -270,4 +350,105 @@ async fn refused_stor_is_relayed_and_the_session_stays_usable() {
     let observed = observed.lock().unwrap();
     assert!(observed.uploads.is_empty());
     assert!(observed.data_handshakes.is_empty());
+}
+
+#[tokio::test]
+async fn each_session_resumes_its_own_control_connections_tls_session() {
+    let pki = test_pki("127.0.0.1");
+    let (backend, observed) = spawn_ftps_backend(
+        &pki,
+        MockOptions {
+            skip_close_notify: false,
+        },
+    )
+    .await;
+    let connector = connector_trusting(&pki.ca_pem, None, BackendTlsMaxVersion::V1_3, "sessions");
+    let gateway = spawn_gateway(
+        backend,
+        connector,
+        PortRange {
+            start: 19430,
+            end: 19439,
+        },
+    )
+    .await;
+
+    for name in ["first.bin", "second.bin"] {
+        let mut client = BufReader::new(TcpStream::connect(gateway).await.unwrap());
+        common::login(&mut client).await;
+        let reply = common::perform_upload(&mut client, name, b"payload").await;
+        assert!(reply.starts_with("226"), "{reply}");
+    }
+
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.uploads.len(), 2);
+    // The second session's control connection is a full handshake: it does not resume the first
+    // session's TLS session. Each session's data connection resumes its own.
+    assert_eq!(
+        observed.control_handshakes,
+        [HandshakeKind::Full, HandshakeKind::Full]
+    );
+    assert_eq!(
+        observed.data_handshakes,
+        [HandshakeKind::Resumed, HandshakeKind::Resumed]
+    );
+}
+
+async fn many_uploads_in_one_session_all_resume(
+    max_version: BackendTlsMaxVersion,
+    port_range: PortRange,
+    tag: &str,
+) {
+    const UPLOADS: usize = 12;
+    let pki = test_pki("127.0.0.1");
+    let (backend, observed) = spawn_ftps_backend(
+        &pki,
+        MockOptions {
+            skip_close_notify: false,
+        },
+    )
+    .await;
+    let connector = connector_trusting(&pki.ca_pem, None, max_version, tag);
+    let gateway = spawn_gateway(backend, connector, port_range).await;
+
+    let mut client = BufReader::new(TcpStream::connect(gateway).await.unwrap());
+    common::login(&mut client).await;
+    for i in 0..UPLOADS {
+        let reply = common::perform_upload(&mut client, &format!("f{i}.bin"), b"payload").await;
+        assert!(reply.starts_with("226"), "upload {i}: {reply}");
+    }
+
+    let observed = observed.lock().unwrap();
+    assert_eq!(observed.uploads.len(), UPLOADS);
+    assert_eq!(
+        observed.data_handshakes,
+        vec![HandshakeKind::Resumed; UPLOADS],
+        "every data connection of the session must resume its TLS session"
+    );
+}
+
+#[tokio::test]
+async fn a_session_with_many_uploads_resumes_every_data_connection_on_tls13() {
+    many_uploads_in_one_session_all_resume(
+        BackendTlsMaxVersion::V1_3,
+        PortRange {
+            start: 19440,
+            end: 19444,
+        },
+        "many-13",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_session_with_many_uploads_resumes_every_data_connection_on_tls12() {
+    many_uploads_in_one_session_all_resume(
+        BackendTlsMaxVersion::V1_2,
+        PortRange {
+            start: 19445,
+            end: 19449,
+        },
+        "many-12",
+    )
+    .await;
 }
