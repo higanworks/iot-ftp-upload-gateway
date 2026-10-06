@@ -268,7 +268,10 @@ from several local addresses instead of the one the OS would pick, multiplying t
 the number of addresses. It is off by default; with it off, nothing here applies.
 
 - **Sources.** Every IPv4 address on the host is a separate source — an interface with several
-  addresses (EC2 secondary private IPs) counts once per address. By default all are used except
+  addresses (EC2 secondary private IPs) counts once per address, and they are used in ascending
+  order of address. An address the OS labels as an alias (`ens5:1`) belongs to its interface
+  (`ens5`) for `include_interfaces` / `exclude_interfaces`; naming the alias itself
+  (`ens5:1`, `ens5:*`) singles it out. By default all are used except
   loopback, link-local, and addresses on virtual interfaces (`lo`, `docker*`, `br-*`, `veth*`,
   `virbr*`, `cni*`, `flannel*`, `cali*`, `tun*`, `tap*`, `tailscale*`, `wg*`). Set
   `include_interfaces` to use only the interfaces you name (naming a virtual one is then
@@ -415,10 +418,44 @@ custom hostname rather than the one you connect to, set `backend_tls.server_name
 `ca_file` if it is signed by a private CA. If resumption fails against your endpoint with TLS 1.3,
 try `max_version: "1.2"`.
 
+### Simplest setup: one ENI, several private IPs
+
+You do not need extra ENIs. Every private IPv4 address on one ENI is a separate source, used in
+ascending order of address: new sessions take the current one, which moves on to the next address
+after as many data connections as the backend's data port range holds (9 for Transfer Family) and
+wraps around after the last. Sessions already running stay on the address they started with.
+Packets sent from a secondary IP leave through the same ENI as the primary address, so no extra
+routing is needed.
+
+1. **Assign the secondary private IPs** to the ENI — in the console, or for example
+   `aws ec2 assign-private-ip-addresses --network-interface-id eni-… --secondary-private-ip-address-count 3`.
+   How many IPs an ENI can hold depends on the instance type.
+2. **Make sure the OS has them configured.** AWS assigns an address to the ENI, but the instance
+   only uses it once its operating system has it configured. Some images do that automatically;
+   others need it done by hand or by their network configuration. Check that every address you
+   assigned is listed:
+
+   ```sh
+   ip -4 addr show dev ens5
+   ```
+
+   An address that is assigned but not configured is invisible to the gateway and is simply not
+   used.
+3. **Run the gateway with `network_mode: host` and `GATEWAY_BACKEND_SOURCE=rotate`.**
+   Auto-detection picks the addresses up (see the note under step 5 below);
+   `GATEWAY_BACKEND_SOURCE_INCLUDE=ens5` pins the choice to that interface, including any
+   addresses the OS labels as aliases (`ens5:1`). An address assigned later is picked up within
+   `refresh_secs`.
+4. **Check the startup log**: `backend source address rotation enabled` lists the addresses the
+   gateway chose — it should be every address from step 1, plus the primary one.
+
+With the primary address and three secondary ones, that is four sources and about 4 × 9 = 36
+concurrent uploads.
+
 ### Several network interfaces on the EC2 instance
 
-To give the gateway several source addresses on EC2, attach extra network interfaces (ENIs) to
-the instance — or add secondary private IPs — and run the container with `network_mode: host`,
+To give the gateway several source addresses on EC2 with extra network interfaces (ENIs) instead
+— or in addition — attach them to the instance and run the container with `network_mode: host`,
 so it sees every address and can bind its outgoing connections to each:
 
 ```mermaid
@@ -449,7 +486,7 @@ up:
 
 1. **Attach the interfaces.** The number of ENIs and of IPs per ENI an instance can have depends
    on its instance type. Each address becomes one source; a secondary IP on an existing ENI works
-   the same way as an extra ENI.
+   the same way as an extra ENI (see [Simplest setup](#simplest-setup-one-eni-several-private-ips)).
 2. **Route each extra ENI's traffic out of that ENI.** Linux sends everything out of the default
    route's interface, and AWS drops a packet whose source address doesn't belong to the ENI it
    leaves through, so each additional ENI needs source-based routing (see the example under

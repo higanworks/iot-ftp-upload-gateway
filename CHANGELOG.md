@@ -10,6 +10,21 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+### Fixed
+
+- With `backend_source` rotation, an address the OS reports under an alias label (`ens5:1`, as
+  produced by `ip addr add ... label ens5:1` or a legacy `ifcfg-ens5:1` secondary-IP alias) was
+  not matched by `include_interfaces: [ens5]`, and `exclude_interfaces: [ens5]` did not drop
+  it. Aliases now belong to their interface for include/exclude and for the built-in
+  virtual-interface skip (`docker0:1`, `lo:1`, ...); a pattern naming the alias itself
+  (`ens5:1`, `ens5:*`) still singles it out.
+
+### Changed
+
+- README: how to use one ENI with several secondary private IPs as the sources — the simplest
+  EC2 setup — including that the addresses must be configured in the OS, not only assigned to
+  the ENI.
+
 ## [2026.10.1] - 2026-10-06
 
 ### Added
