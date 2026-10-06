@@ -5,6 +5,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
+use rustls::client::Resumption;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
@@ -83,16 +84,27 @@ impl AsyncWrite for BackendStream {
     }
 }
 
-/// Builds TLS client connections to the backend. Cheap to clone and meant to be built once at
-/// startup and shared by every session: all connections made through clones share one
-/// `ClientConfig`, and therefore one TLS session-resumption store. That sharing is what lets a
-/// data connection resume the control connection's session, which backends that enforce session
-/// reuse (RFC 4217; e.g. vsftpd's `require_ssl_reuse`) demand.
+/// Builds TLS client connections to the backend. Built once at startup (which also validates the
+/// CA file) and cloned into every session, each of which calls `for_session` to get a connector
+/// of its own: connections made through the *same* connector share one TLS session-resumption
+/// store, which is what lets a data connection resume the control connection's session -- the
+/// reuse that backends such as vsftpd (`require_ssl_reuse`) and AWS Transfer Family (by default)
+/// demand -- while different sessions never share one.
 #[derive(Clone)]
 pub struct BackendTlsConnector {
+    config: Arc<ClientConfig>,
     connector: TlsConnector,
     server_name: Option<String>,
 }
+
+/// How many TLS sessions (TLS 1.3 tickets) a session's resumption store may hold. A session talks
+/// to one backend, so it needs few -- but not as few as it seems: rustls sizes the store in
+/// groups of 8 tickets per server name and evicts the oldest entry as soon as the store is
+/// "full", which for a store of just one group means the entry it has only just inserted. Sized
+/// for a single server name (anything up to 8) the store never resumes anything, so keep it at
+/// two groups or more; the `..._keeps_resuming_across_many_connections` tests would catch a change
+/// that breaks this.
+const SESSION_RESUMPTION_ENTRIES: usize = 32;
 
 impl BackendTlsConnector {
     /// Fails if `ca_file` cannot be read, contains no certificates, or holds unusable ones, so a
@@ -137,10 +149,34 @@ impl BackendTlsConnector {
                 .with_root_certificates(roots)
                 .with_no_client_auth();
 
+        let client_config = Arc::new(client_config);
         Ok(BackendTlsConnector {
-            connector: TlsConnector::from(Arc::new(client_config)),
+            connector: TlsConnector::from(Arc::clone(&client_config)),
+            config: client_config,
             server_name: config.server_name.clone(),
         })
+    }
+
+    /// A connector for one FTP session, with a TLS resumption store of its own.
+    ///
+    /// Backends that enforce session reuse (RFC 4217; vsftpd's `require_ssl_reuse`) want a data
+    /// connection to resume the *control connection's* session. With one store shared by every
+    /// session, a data connection could resume a ticket another session's control connection had
+    /// left there -- and a new session's control connection would "resume" a stranger's session
+    /// -- so the session gets its own: its control and data connections share it, and nothing
+    /// else does. It is dropped with the session.
+    ///
+    /// Everything else (certificate verification, protocol versions, the CA roots) is shared with
+    /// `self`; only the small resumption store is new.
+    pub fn for_session(&self) -> BackendTlsConnector {
+        let mut config = ClientConfig::clone(&self.config);
+        config.resumption = Resumption::in_memory_sessions(SESSION_RESUMPTION_ENTRIES);
+        let config = Arc::new(config);
+        BackendTlsConnector {
+            connector: TlsConnector::from(Arc::clone(&config)),
+            config,
+            server_name: self.server_name.clone(),
+        }
     }
 
     /// Runs the TLS handshake over `tcp`. The certificate is verified against the configured
@@ -441,6 +477,90 @@ mod tests {
 
         assert_eq!(rx.recv().await.unwrap(), HandshakeKind::Full);
         assert_eq!(rx.recv().await.unwrap(), HandshakeKind::Resumed);
+    }
+
+    #[tokio::test]
+    async fn a_new_session_does_not_resume_another_sessions_tls_session() {
+        let pki = test_pki("localhost");
+        let (addr, mut rx) = spawn_tls_echo_server(&pki, 4).await;
+        let base = BackendTlsConnector::new(&tls_config(&pki.ca_pem)).unwrap();
+        let session_a = base.for_session();
+        let session_b = base.for_session();
+
+        // Control connections of two sessions, then each session's data connection.
+        round_trip(&session_a, addr, "localhost").await;
+        round_trip(&session_b, addr, "localhost").await;
+        round_trip(&session_a, addr, "localhost").await;
+        round_trip(&session_b, addr, "localhost").await;
+
+        // Session B's first connection is a full handshake -- it does not pick up the ticket
+        // session A left behind -- and each data connection resumes (its own session's ticket).
+        let kinds: Vec<_> = vec![
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+        ];
+        assert_eq!(
+            kinds,
+            [
+                HandshakeKind::Full,
+                HandshakeKind::Full,
+                HandshakeKind::Resumed,
+                HandshakeKind::Resumed
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connector_shared_by_two_sessions_would_resume_a_strangers_session() {
+        // The behavior `for_session` exists to prevent, shown on the un-split connector: the
+        // second "session" resumes the first one's ticket on its very first connection.
+        let pki = test_pki("localhost");
+        let (addr, mut rx) = spawn_tls_echo_server(&pki, 2).await;
+        let shared = BackendTlsConnector::new(&tls_config(&pki.ca_pem)).unwrap();
+
+        round_trip(&shared, addr, "localhost").await; // session A's control connection
+        round_trip(&shared, addr, "localhost").await; // session B's control connection
+
+        assert_eq!(rx.recv().await.unwrap(), HandshakeKind::Full);
+        assert_eq!(rx.recv().await.unwrap(), HandshakeKind::Resumed);
+    }
+
+    /// A TLS 1.3 ticket can be used once, so a session's store has to be topped up by the
+    /// tickets the server sends on each connection of that session, or a session making many
+    /// uploads would run out and fall back to full handshakes -- which a backend enforcing
+    /// session reuse refuses.
+    async fn a_session_resumes_on_every_one_of_many_connections(max_version: BackendTlsMaxVersion) {
+        const CONNECTIONS: usize = 15;
+        let pki = test_pki("localhost");
+        let (addr, mut rx) = spawn_tls_echo_server(&pki, CONNECTIONS).await;
+        let mut config = tls_config(&pki.ca_pem);
+        config.max_version = max_version;
+        let session = BackendTlsConnector::new(&config).unwrap().for_session();
+
+        for _ in 0..CONNECTIONS {
+            round_trip(&session, addr, "localhost").await;
+        }
+
+        assert_eq!(rx.recv().await.unwrap(), HandshakeKind::Full);
+        for n in 1..CONNECTIONS {
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                HandshakeKind::Resumed,
+                "connection {n} of the session did not resume"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tls13_session_keeps_resuming_across_many_connections() {
+        a_session_resumes_on_every_one_of_many_connections(BackendTlsMaxVersion::V1_3).await;
+    }
+
+    #[tokio::test]
+    async fn a_tls12_session_keeps_resuming_across_many_connections() {
+        a_session_resumes_on_every_one_of_many_connections(BackendTlsMaxVersion::V1_2).await;
     }
 
     #[tokio::test]

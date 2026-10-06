@@ -173,6 +173,10 @@ pub async fn handle(
     tracing::info!("session started");
     let _session_guard = metrics.session_started();
 
+    // One TLS resumption store per session, so this session's data connections resume *its*
+    // control connection's TLS session rather than some other session's.
+    let backend_tls = backend_tls.map(|connector| connector.for_session());
+
     // The control connection is a long-running series of small one-line command/reply round
     // trips; leaving Nagle's algorithm enabled would add its characteristic latency to each one.
     if let Err(err) = client.set_nodelay(true) {
