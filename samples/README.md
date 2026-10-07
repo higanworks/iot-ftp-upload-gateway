@@ -126,3 +126,39 @@ sudo systemctl enable --now iot-ftp-upload-gateway-metrics.timer
 (`%H` expands to the host's short hostname, not the EC2 instance ID -- swap in an
 `ExecStartPre` that resolves the instance ID via instance metadata if you need that specifically
 as the dimension value.)
+
+## docker-compose.transfer-family.yml
+
+Runs the gateway with [AWS Transfer Family as the backend](../README.md#using-aws-transfer-family-as-the-backend)
+on an EC2 instance, with Explicit FTPS to the backend, source-address rotation, JSON logs sent to
+CloudWatch Logs, and the metrics endpoint on loopback. Unlike the compose files in the repository
+root, it does not start any FTP server of its own.
+
+1. **Edit the placeholders** in the file: the endpoint host name in `GATEWAY_BACKENDS`, the
+   address devices reach the gateway at in `GATEWAY_PASSIVE_ADDRESS` (and the passive port range if
+   you want another one), and the region and log group under `logging.options`.
+2. **Check the network path.** The instance must reach the endpoint directly (no NAT gateway or NLB
+   in between), the endpoint's security group must allow port 21 and 8192-8200 from every source
+   address of the instance, and the instance's security group must allow the listen port and the
+   passive port range from the devices. See the README section linked above for why.
+3. **Give the instance role** `logs:CreateLogStream` and `logs:PutLogEvents` (plus
+   `logs:CreateLogGroup` while `awslogs-create-group` is `"true"`). The Docker daemon does the
+   sending, not the container.
+4. **Start it and check the log:**
+
+   ```sh
+   docker compose -f samples/docker-compose.transfer-family.yml up -d
+   docker compose -f samples/docker-compose.transfer-family.yml logs gateway
+   ```
+
+   `backend source address rotation enabled` lists the source addresses the gateway chose; each
+   one adds roughly nine concurrent uploads.
+
+Things to know:
+
+- `network_mode: host` means there is no `ports:` mapping; the gateway's ports open on the host.
+- The container runs as root (`user: "0:0"`) so it can listen on port 21; the comments in the file
+  describe the non-root alternative.
+- The image tag is pinned; bump it when you upgrade.
+- To scrape the metrics with [cloudwatch_metrics.py](#cloudwatch_metricspy), use
+  `--metrics-url http://127.0.0.1:9273/metrics`.

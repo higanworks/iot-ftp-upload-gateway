@@ -1,0 +1,100 @@
+# Sample: iot-ftp-upload-gateway with AWS Transfer Family as the backend.
+#
+# Meant to run on an EC2 instance in the same VPC as the Transfer Family endpoint. It is an
+# example to adapt, not something this project runs itself -- see the README section "Using AWS
+# Transfer Family as the backend" for the reasoning behind each setting.
+#
+#   docker compose -f samples/docker-compose.transfer-family.yml up -d
+#
+# Before using it:
+#   - Replace the endpoint host name in GATEWAY_BACKENDS and the address in
+#     GATEWAY_PASSIVE_ADDRESS.
+#   - Connect to the endpoint directly (same VPC, peering, Transit Gateway, VPN, ...). No NAT
+#     gateway or NLB between the gateway and Transfer Family.
+#   - Open the endpoint's security group for port 21 and 8192-8200 from every source address
+#     this host will use (see GATEWAY_BACKEND_SOURCE below).
+#   - Open this host's security group for the listen port and the passive port range to the
+#     devices.
+
+services:
+  gateway:
+    # Pin a version tag in production; tags are the release version without the leading "v".
+    image: ghcr.io/higanworks/iot-ftp-upload-gateway:2026.10.2
+
+    # Host networking lets the gateway see every address of the instance (ENIs and secondary
+    # private IPs) so that backend source rotation can bind its outgoing connections to each.
+    # It also means there is no `ports:` mapping: the ports below are opened on the host as is.
+    network_mode: host
+    restart: unless-stopped
+
+    # The image runs as a non-root user by default, which cannot bind port 21 (a privileged
+    # port; with host networking the container cannot lower the limit via sysctl either). Run
+    # as root so the gateway can listen on the standard FTP port. To avoid root, remove this,
+    # set GATEWAY_LISTEN_PORT to an unprivileged port (e.g. 2121) and map 21 to it outside
+    # (NLB listener, iptables, ...).
+    user: "0:0"
+
+    environment:
+      # --- Devices -> gateway (plain FTP) ---
+      GATEWAY_LISTEN_PORT: "21"
+      # Address announced in PASV replies: one the devices can reach (the instance's private IP,
+      # or the NLB / Elastic IP in front of the gateway).
+      GATEWAY_PASSIVE_ADDRESS: "10.0.1.10"
+      GATEWAY_PASSIVE_PORT_RANGE_START: "10000"
+      GATEWAY_PASSIVE_PORT_RANGE_END: "10100"
+
+      # --- Gateway -> Transfer Family ---
+      # `host:port@first:last` -- the part after @ is the endpoint's data port range, which is
+      # 8192-8200 for Transfer Family (and the default, so it is spelled out only for clarity).
+      GATEWAY_BACKENDS: "s-0123456789abcdef0.server.transfer.us-east-1.amazonaws.com:21@8192:8200"
+
+      # Transfer Family FTPS requires AUTH TLS / PROT P and TLS session resumption on data
+      # connections; "explicit" makes the gateway negotiate that itself.
+      GATEWAY_BACKEND_TLS: "explicit"
+      # Only needed if the endpoint presents a certificate for a custom host name rather than
+      # the one in GATEWAY_BACKENDS:
+      # GATEWAY_BACKEND_TLS_SERVER_NAME: "ftp.example.com"
+      # Only needed if the certificate is signed by a private CA. The file must be readable
+      # inside the container, so mount it (see `volumes:` below):
+      # GATEWAY_BACKEND_TLS_CA_FILE: "/etc/gateway/ca.pem"
+      # If TLS session resumption fails against the endpoint with TLS 1.3, try 1.2:
+      # GATEWAY_BACKEND_TLS_MAX_VERSION: "1.2"
+
+      # Transfer Family offers only nine data ports per client IP, so connect from every local
+      # address in turn: N source addresses give roughly N x 9 concurrent uploads. With no
+      # include/exclude set, every real (non-virtual) IPv4 address of the host is used. The
+      # startup log line "backend source address rotation enabled" lists the chosen ones.
+      GATEWAY_BACKEND_SOURCE: "rotate"
+      # Pin or trim the set of interfaces instead of auto-detecting (wildcards work):
+      # GATEWAY_BACKEND_SOURCE_INCLUDE: "ens5,ens6"
+      # GATEWAY_BACKEND_SOURCE_EXCLUDE: "ens7"
+
+      # --- Metrics ---
+      # Scrape http://127.0.0.1:9273/metrics, e.g. with samples/cloudwatch_metrics.py. Bound to
+      # loopback because the host network is shared; use 0.0.0.0 only if something off-host
+      # scrapes it and the security group restricts who can.
+      GATEWAY_METRICS_ADDRESS: "127.0.0.1"
+      GATEWAY_METRICS_PORT: "9273"
+
+      RUST_LOG: "info"
+      # One JSON object per line is easier to query with CloudWatch Logs Insights.
+      GATEWAY_LOG_FORMAT: "json"
+
+    # Send stdout/stderr to CloudWatch Logs through Docker's awslogs driver. The Docker daemon
+    # (not the container) does the sending, using the instance role, which needs
+    # logs:CreateLogStream and logs:PutLogEvents (plus logs:CreateLogGroup if
+    # awslogs-create-group is "true"). `docker logs` still works with this driver on Docker 20.10+.
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: "us-east-1"
+        awslogs-group: "/iot-ftp-upload-gateway"
+        awslogs-create-group: "true"
+        # Stream name (default: the container ID). Container names repeat across instances, so
+        # for several gateways either keep the default or set a fixed, per-instance
+        # awslogs-stream (the two are alternatives; awslogs-stream wins over tag).
+        tag: "{{.Name}}/{{.ID}}"
+        # awslogs-stream: "gateway-01"
+
+    # volumes:
+    #   - ./ca.pem:/etc/gateway/ca.pem:ro
