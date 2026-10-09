@@ -123,22 +123,24 @@ pub async fn open_backend_data_connection(
         ))
     })?;
 
-    match tokio::time::timeout(
-        limits.connect_timeout,
-        connect_from(SocketAddr::from((ip, port)), local_ip),
-    )
-    .await
-    {
+    let data_addr = SocketAddr::from((ip, port));
+    tracing::debug!(reply = %line.trim_end(), backend_data_addr = %data_addr, "backend PASV reply");
+
+    match tokio::time::timeout(limits.connect_timeout, connect_from(data_addr, local_ip)).await {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(err)) => Err(DataConnectError::ConnectFailed(
-            anyhow::Error::new(err).context("failed to connect to backend data port"),
+            anyhow::Error::new(err).context(format!(
+                "failed to connect to backend data port {data_addr}"
+            )),
         )),
         Err(_) => Err(DataConnectError::ConnectFailed(
             anyhow::Error::new(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "connecting to the backend data port timed out",
             ))
-            .context("failed to connect to backend data port"),
+            .context(format!(
+                "failed to connect to backend data port {data_addr}"
+            )),
         )),
     }
 }
