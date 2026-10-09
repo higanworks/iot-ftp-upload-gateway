@@ -17,6 +17,29 @@ pub fn epsv_reply(port: u16) -> String {
     format!("229 Entering Extended Passive Mode (|||{port}|).\r\n")
 }
 
+/// Parses a 229 EPSV reply (e.g. "229 Entering Extended Passive Mode (|||6446|).") and extracts
+/// the port to connect to (RFC 2428). The reply carries no address; the caller reuses the one of
+/// the control connection. The delimiter may be any character from `!` to `~`, the same on all
+/// four positions.
+pub fn parse_epsv_reply(line: &str) -> Option<u16> {
+    let start = line.find('(')?;
+    let end = start + line[start..].find(')')?;
+    let inner = &line[start + 1..end];
+    let delimiter = inner.chars().next().filter(|c| c.is_ascii_graphic())?;
+    let mut fields = inner.split(delimiter);
+    let [Some(""), Some(""), Some(""), Some(port), Some(""), None] = [
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ] else {
+        return None;
+    };
+    port.parse().ok().filter(|&port| port != 0)
+}
+
 /// Parses a 227 PASV reply (e.g. "227 Entering Passive Mode (127,0,0,1,39,16).")
 /// and extracts the address and port to connect to. Used when the Gateway itself
 /// acts as a PASV client toward a backend server.
@@ -86,6 +109,34 @@ mod tests {
         let port = 51200;
         let reply = pasv_reply(ip, port);
         assert_eq!(parse_pasv_reply(&reply), Some((ip, port)));
+    }
+
+    #[test]
+    fn parses_epsv_reply() {
+        assert_eq!(
+            parse_epsv_reply("229 Entering Extended Passive Mode (|||6446|).\r\n"),
+            Some(6446)
+        );
+        assert_eq!(parse_epsv_reply(&epsv_reply(65535)), Some(65535));
+        // Any delimiter is allowed, as long as it is the same throughout.
+        assert_eq!(parse_epsv_reply("229 ok (!!!2121!)"), Some(2121));
+    }
+
+    #[test]
+    fn rejects_malformed_epsv_reply() {
+        for line in [
+            "502 Command not implemented.",
+            "229 no parens",
+            "229 (||||)",
+            "229 (|||0|)",
+            "229 (|||70000|)",
+            "229 (|||abc|)",
+            "229 (|1.2.3.4|6446|)",
+            "229 (|||6446|extra|)",
+            "229 (|||6446)",
+        ] {
+            assert_eq!(parse_epsv_reply(line), None, "{line}");
+        }
     }
 
     #[test]

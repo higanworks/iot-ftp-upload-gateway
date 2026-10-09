@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -8,7 +8,8 @@ use tokio::net::TcpStream;
 
 use crate::backend::connection::connect_from;
 use crate::backend::tls::BackendStream;
-use crate::protocol::reply::parse_pasv_reply;
+use crate::config::BackendPassiveMode;
+use crate::protocol::reply::{parse_epsv_reply, parse_pasv_reply};
 
 /// Why opening a backend data connection failed. The distinction matters to the caller: only one
 /// of the two leaves the backend control connection usable.
@@ -59,10 +60,74 @@ pub struct DataConnectLimits {
     /// Longest `PASV` reply line accepted, so a backend that never sends a newline cannot make
     /// the gateway buffer without bound.
     pub max_line_bytes: usize,
+    /// Connect to the control connection's address when the backend's `PASV` reply names
+    /// `0.0.0.0` (`limits.backend_pasv_fallback_to_control_ip`).
+    pub fallback_to_control_ip: bool,
+    /// Whether to ask for the data port with `EPSV` (falling back to `PASV`) or `PASV` only.
+    pub passive_mode: BackendPassiveMode,
+}
+
+/// The address to connect to for a data connection whose backend announced `announced`.
+///
+/// A backend that cannot work out its own address (vsftpd with `listen_ipv6=YES`, for one)
+/// announces `0.0.0.0`, which would reach the gateway's own host. With `fallback`, the address of
+/// the control connection is used instead, as most FTP clients do. An IPv6 or unknown control
+/// address leaves the announced one as it is.
+fn data_ip(announced: Ipv4Addr, control: Option<IpAddr>, fallback: bool) -> Ipv4Addr {
+    match control {
+        Some(IpAddr::V4(control)) if fallback && announced.is_unspecified() => control,
+        _ => announced,
+    }
+}
+
+/// Sends `command` on the backend's control connection and reads its one-line reply, bounded by
+/// `limits`. Failures mean the control connection is out of step from here on.
+async fn command_reply(
+    backend_control: &mut BufReader<BackendStream>,
+    command: &str,
+    limits: DataConnectLimits,
+) -> Result<String, DataConnectError> {
+    let reply = tokio::time::timeout(limits.reply_timeout, async {
+        backend_control
+            .write_all(format!("{command}\r\n").as_bytes())
+            .await?;
+        let mut line = String::new();
+        let bytes_read = (&mut *backend_control)
+            .take(limits.max_line_bytes as u64)
+            .read_line(&mut line)
+            .await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "backend closed the control connection while opening a data connection",
+            ));
+        }
+        if !line.ends_with('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("backend's {command} reply exceeds the maximum line length"),
+            ));
+        }
+        Ok(line)
+    })
+    .await;
+    match reply {
+        Ok(Ok(line)) => Ok(line),
+        Ok(Err(err)) => Err(DataConnectError::ControlConnection(
+            anyhow::Error::new(err)
+                .context(format!("reading the backend's {command} reply failed")),
+        )),
+        Err(_) => Err(DataConnectError::ControlConnection(anyhow::Error::new(
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for the backend's {command} reply"),
+            ),
+        ))),
+    }
 }
 
 /// Asks the backend to open a passive data connection and connects to the address/port
-/// it returns. The Gateway itself acts as a PASV client toward the backend here.
+/// it returns. The Gateway itself acts as an EPSV/PASV client toward the backend here.
 ///
 /// With `local_ip`, the connection is made from that local address -- the same one the control
 /// connection uses, since backends tie a data connection to its control connection's client IP.
@@ -78,53 +143,55 @@ pub async fn open_backend_data_connection(
     local_ip: Option<Ipv4Addr>,
     limits: DataConnectLimits,
 ) -> Result<TcpStream, DataConnectError> {
-    let reply = tokio::time::timeout(limits.reply_timeout, async {
-        backend_control.write_all(b"PASV\r\n").await?;
-        let mut line = String::new();
-        let bytes_read = (&mut *backend_control)
-            .take(limits.max_line_bytes as u64)
-            .read_line(&mut line)
-            .await?;
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "backend closed the control connection while opening a data connection",
-            ));
-        }
-        if !line.ends_with('\n') {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "backend's PASV reply exceeds the maximum line length",
-            ));
-        }
-        Ok(line)
-    })
-    .await;
-    let line = match reply {
-        Ok(Ok(line)) => line,
-        Ok(Err(err)) => {
-            return Err(DataConnectError::ControlConnection(
-                anyhow::Error::new(err).context("reading the backend's PASV reply failed"),
-            ));
-        }
-        Err(_) => {
-            return Err(DataConnectError::ControlConnection(anyhow::Error::new(
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "timed out waiting for the backend's PASV reply",
-                ),
-            )));
-        }
+    let control_peer = backend_control.get_ref().peer_addr().ok();
+
+    let mut command = match limits.passive_mode {
+        BackendPassiveMode::Epsv => "EPSV",
+        BackendPassiveMode::Pasv => "PASV",
     };
+    let mut line = command_reply(backend_control, command, limits).await?;
+    if command == "EPSV" && line.starts_with('5') {
+        // A backend that does not know EPSV (or the network protocol) says so with a 5xx reply
+        // and stays in step, so the control connection is still usable for PASV.
+        tracing::debug!(reply = %line.trim_end(), "backend rejected EPSV; using PASV");
+        command = "PASV";
+        line = command_reply(backend_control, command, limits).await?;
+    }
 
-    let (ip, port) = parse_pasv_reply(&line).ok_or_else(|| {
-        DataConnectError::UnusableReply(anyhow!(
-            "backend returned an unparsable PASV reply: {line:?}"
-        ))
-    })?;
-
-    let data_addr = SocketAddr::from((ip, port));
-    tracing::debug!(reply = %line.trim_end(), backend_data_addr = %data_addr, "backend PASV reply");
+    let data_addr = if command == "EPSV" {
+        let port = parse_epsv_reply(&line).ok_or_else(|| {
+            DataConnectError::UnusableReply(anyhow!(
+                "backend returned an unusable EPSV reply: {line:?}"
+            ))
+        })?;
+        // The reply names no address: the data connection goes to the control connection's.
+        let peer = control_peer.ok_or_else(|| {
+            DataConnectError::UnusableReply(anyhow!(
+                "cannot tell the backend's address to connect to its EPSV data port"
+            ))
+        })?;
+        SocketAddr::new(peer.ip(), port)
+    } else {
+        let (announced_ip, port) = parse_pasv_reply(&line).ok_or_else(|| {
+            DataConnectError::UnusableReply(anyhow!(
+                "backend returned an unparsable PASV reply: {line:?}"
+            ))
+        })?;
+        let ip = data_ip(
+            announced_ip,
+            control_peer.map(|peer| peer.ip()),
+            limits.fallback_to_control_ip,
+        );
+        if ip != announced_ip {
+            tracing::warn!(
+                reply = %line.trim_end(),
+                using = %ip,
+                "backend announced 0.0.0.0 in its PASV reply; using the control connection's address instead (the backend should set its passive address, e.g. vsftpd's pasv_address)"
+            );
+        }
+        SocketAddr::from((ip, port))
+    };
+    tracing::debug!(command, reply = %line.trim_end(), backend_data_addr = %data_addr, "backend passive reply");
 
     match tokio::time::timeout(limits.connect_timeout, connect_from(data_addr, local_ip)).await {
         Ok(Ok(stream)) => Ok(stream),
@@ -236,7 +303,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
-    use crate::protocol::reply::pasv_reply;
+    use crate::protocol::reply::{epsv_reply, pasv_reply};
 
     #[tokio::test]
     async fn opens_data_connection_via_backend_pasv() {
@@ -318,17 +385,55 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn an_unspecified_announced_address_is_replaced_by_the_control_address() {
+        let control = Some(IpAddr::from([10, 0, 0, 5]));
+        let unspecified = Ipv4Addr::UNSPECIFIED;
+        assert_eq!(
+            data_ip(unspecified, control, true),
+            Ipv4Addr::new(10, 0, 0, 5)
+        );
+        // Switched off, or an address the backend really announced: taken literally.
+        assert_eq!(data_ip(unspecified, control, false), unspecified);
+        let announced = Ipv4Addr::new(192, 0, 2, 7);
+        assert_eq!(data_ip(announced, control, true), announced);
+        // No usable IPv4 control address to fall back to.
+        assert_eq!(data_ip(unspecified, None, true), unspecified);
+        assert_eq!(
+            data_ip(
+                unspecified,
+                Some(IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1])),
+                true
+            ),
+            unspecified
+        );
+    }
+
     fn limits() -> DataConnectLimits {
         DataConnectLimits {
             reply_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
             max_line_bytes: 4096,
+            fallback_to_control_ip: true,
+            passive_mode: BackendPassiveMode::Pasv,
         }
     }
 
     /// A control connection to a backend whose behavior is `script`, which gets the backend's
     /// side of the connection after it has received the `PASV` command.
     async fn control_with_backend<F, Fut>(script: F) -> BufReader<BackendStream>
+    where
+        F: FnOnce(BufReader<TcpStream>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        control_expecting("PASV", script).await
+    }
+
+    /// Like `control_with_backend`, for a backend that is first sent `first_command`.
+    async fn control_expecting<F, Fut>(
+        first_command: &'static str,
+        script: F,
+    ) -> BufReader<BackendStream>
     where
         F: FnOnce(BufReader<TcpStream>) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -340,11 +445,88 @@ mod tests {
             let mut stream = BufReader::new(stream);
             let mut line = String::new();
             stream.read_line(&mut line).await.unwrap();
-            assert_eq!(line, "PASV\r\n");
+            assert_eq!(line, format!("{first_command}\r\n"));
             script(stream).await;
         });
         let control = TcpStream::connect(addr).await.unwrap();
         BufReader::new(BackendStream::Plain(control))
+    }
+
+    fn epsv_limits() -> DataConnectLimits {
+        DataConnectLimits {
+            passive_mode: BackendPassiveMode::Epsv,
+            ..limits()
+        }
+    }
+
+    #[tokio::test]
+    async fn epsv_connects_to_the_control_address_at_the_announced_port() {
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = data_listener.accept().await.unwrap();
+        });
+        let mut control = control_expecting("EPSV", move |mut stream| async move {
+            stream
+                .write_all(epsv_reply(data_port).as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        let data = open_backend_data_connection(&mut control, None, epsv_limits())
+            .await
+            .unwrap();
+        assert_eq!(data.peer_addr().unwrap().port(), data_port);
+    }
+
+    #[tokio::test]
+    async fn a_backend_rejecting_epsv_is_asked_for_pasv_on_the_same_connection() {
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = data_listener.accept().await.unwrap();
+        });
+        let mut control = control_expecting("EPSV", move |mut stream| async move {
+            stream
+                .write_all(b"502 Command not implemented.\r\n")
+                .await
+                .unwrap();
+            let mut line = String::new();
+            stream.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "PASV\r\n");
+            stream
+                .write_all(pasv_reply(Ipv4Addr::LOCALHOST, data_port).as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        let data = open_backend_data_connection(&mut control, None, epsv_limits())
+            .await
+            .unwrap();
+        assert_eq!(data.peer_addr().unwrap().port(), data_port);
+    }
+
+    #[tokio::test]
+    async fn an_epsv_failure_that_is_not_a_rejection_does_not_fall_back() {
+        let mut control = control_expecting("EPSV", |mut stream| async move {
+            stream
+                .write_all(b"425 Can't open data connection\r\n")
+                .await
+                .unwrap();
+            // Anything further from the gateway would be a protocol slip; it must not ask again.
+            let mut line = String::new();
+            let n =
+                tokio::time::timeout(Duration::from_millis(300), stream.read_line(&mut line)).await;
+            assert!(n.is_err() || line.is_empty(), "unexpected command {line:?}");
+        })
+        .await;
+        let result = open_backend_data_connection(&mut control, None, epsv_limits()).await;
+        assert!(
+            matches!(result, Err(DataConnectError::UnusableReply(_))),
+            "{result:?}"
+        );
     }
 
     fn is_control_error(result: &Result<TcpStream, DataConnectError>) -> bool {

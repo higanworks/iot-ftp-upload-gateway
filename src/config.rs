@@ -186,6 +186,28 @@ impl BackendSourceMode {
     }
 }
 
+/// Which passive-mode command the gateway sends to a backend to open a data connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendPassiveMode {
+    /// `EPSV`, whose reply carries only a port and so cannot name a wrong address; falls back to
+    /// `PASV` for a backend that rejects it with a `5xx` reply.
+    #[default]
+    Epsv,
+    /// Always `PASV`.
+    Pasv,
+}
+
+impl BackendPassiveMode {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.to_ascii_lowercase().as_str() {
+            "epsv" => Ok(BackendPassiveMode::Epsv),
+            "pasv" => Ok(BackendPassiveMode::Pasv),
+            other => bail!("invalid backend passive mode '{other}', expected 'epsv' or 'pasv'"),
+        }
+    }
+}
+
 /// Which local addresses the gateway uses as the source of its backend connections.
 ///
 /// With `include_interfaces` set, only those interfaces are used. Otherwise every usable IPv4
@@ -318,6 +340,16 @@ pub struct LimitsConfig {
     /// Set to `false` only if devices legitimately open their data connections from a different
     /// address than their control connections (some carrier-grade NAT pools do).
     pub require_data_ip_match: bool,
+    /// When a backend's `PASV` reply names the unspecified address (`0.0.0.0`, which vsftpd
+    /// sends when it cannot work out its own address, e.g. under `listen_ipv6=YES`), connect to
+    /// the data port at the address the control connection goes to instead (default `true`).
+    /// Connecting to `0.0.0.0` would reach the gateway's own host, so such a reply cannot work
+    /// otherwise; most FTP clients make the same substitution. Set to `false` to treat the
+    /// reply literally.
+    pub backend_pasv_fallback_to_control_ip: bool,
+    /// The command sent to a backend to open a data connection (default `epsv`, falling back to
+    /// `pasv` if the backend rejects it). `pasv` skips the `EPSV` attempt.
+    pub backend_passive_mode: BackendPassiveMode,
 }
 
 impl Default for LimitsConfig {
@@ -326,6 +358,8 @@ impl Default for LimitsConfig {
             max_command_line_bytes: 4096,
             max_connections_per_ip: 10,
             require_data_ip_match: true,
+            backend_pasv_fallback_to_control_ip: true,
+            backend_passive_mode: BackendPassiveMode::Epsv,
         }
     }
 }
@@ -453,6 +487,13 @@ impl Config {
         if let Some(v) = env_var("GATEWAY_REQUIRE_DATA_IP_MATCH")? {
             self.limits.require_data_ip_match =
                 parse_bool(&v).context("invalid GATEWAY_REQUIRE_DATA_IP_MATCH")?;
+        }
+        if let Some(v) = env_var("GATEWAY_BACKEND_PASV_FALLBACK_TO_CONTROL_IP")? {
+            self.limits.backend_pasv_fallback_to_control_ip =
+                parse_bool(&v).context("invalid GATEWAY_BACKEND_PASV_FALLBACK_TO_CONTROL_IP")?;
+        }
+        if let Some(v) = env_var("GATEWAY_BACKEND_PASSIVE_MODE")? {
+            self.limits.backend_passive_mode = BackendPassiveMode::parse(&v)?;
         }
         if let Some(v) = env_var("GATEWAY_METRICS_ADDRESS")? {
             self.metrics.address = v.parse().context("invalid GATEWAY_METRICS_ADDRESS")?;
@@ -748,6 +789,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn backend_passive_mode_defaults_to_epsv_and_can_be_set_to_pasv() {
+        assert_eq!(
+            Config::default().limits.backend_passive_mode,
+            BackendPassiveMode::Epsv
+        );
+        let config: Config =
+            serde_yaml::from_str("limits:\n  backend_passive_mode: pasv\n").unwrap();
+        assert_eq!(config.limits.backend_passive_mode, BackendPassiveMode::Pasv);
+        assert_eq!(
+            BackendPassiveMode::parse("EPSV").unwrap(),
+            BackendPassiveMode::Epsv
+        );
+        assert!(BackendPassiveMode::parse("port").is_err());
+    }
+
+    #[test]
+    fn pasv_control_ip_fallback_defaults_to_on_and_can_be_switched_off() {
+        assert!(Config::default().limits.backend_pasv_fallback_to_control_ip);
+        let config: Config =
+            serde_yaml::from_str("limits:\n  backend_pasv_fallback_to_control_ip: false\n")
+                .unwrap();
+        assert!(!config.limits.backend_pasv_fallback_to_control_ip);
+        assert!(config.limits.require_data_ip_match);
     }
 
     #[test]

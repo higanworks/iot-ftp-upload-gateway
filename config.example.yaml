@@ -13,6 +13,8 @@
 #   GATEWAY_CONNECTION_TIMEOUT_SECS
 #   GATEWAY_IDLE_TIMEOUT_SECS
 #   GATEWAY_REQUIRE_DATA_IP_MATCH    ("true" or "false")
+#   GATEWAY_BACKEND_PASSIVE_MODE     ("epsv" or "pasv")
+#   GATEWAY_BACKEND_PASV_FALLBACK_TO_CONTROL_IP  ("true" or "false")
 #   GATEWAY_BACKEND_TLS              ("off" or "explicit")
 #   GATEWAY_BACKEND_TLS_CA_FILE
 #   GATEWAY_BACKEND_TLS_SERVER_NAME
@@ -78,3 +80,10 @@ limits:
   # from different addresses (some carrier-grade NAT pools); it does nothing behind a load
   # balancer that doesn't preserve the client IP. See README, "Run".
   require_data_ip_match: true
+  # When a backend's PASV reply names 0.0.0.0 (vsftpd does when it cannot work out its own
+  # address), connect to the data port at the address the control connection goes to instead
+  # (default true), as most FTP clients do. Set to false to take the reply literally.
+  backend_pasv_fallback_to_control_ip: true
+  # The command sent to a backend to open a data connection (default epsv): EPSV first, PASV if
+  # the backend rejects it with a 5xx reply. Set to pasv to send only PASV.
+  backend_passive_mode: epsv

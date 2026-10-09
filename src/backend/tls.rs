@@ -25,6 +25,16 @@ pub enum BackendStream {
     Tls(Box<TlsStream<TcpStream>>),
 }
 
+impl BackendStream {
+    /// The address of the server this connection goes to.
+    pub fn peer_addr(&self) -> io::Result<std::net::SocketAddr> {
+        match self {
+            BackendStream::Plain(stream) => stream.peer_addr(),
+            BackendStream::Tls(stream) => stream.get_ref().0.peer_addr(),
+        }
+    }
+}
+
 impl AsyncRead for BackendStream {
     fn poll_read(
         self: Pin<&mut Self>,
