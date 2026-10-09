@@ -10,6 +10,16 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.10.3] - 2026-10-09
+
+### Changed
+
+- With `RUST_LOG=debug`, the backend's reply to the gateway's `PASV` is now logged
+  (`backend PASV reply`, with the raw reply line and the address the gateway will connect to).
+- The error logged when the gateway cannot connect to the backend's data port now names the
+  address (`failed to connect to backend data port 10.0.0.5:30000: ...`), so a backend that
+  announces an unreachable address can be spotted without debug logging.
+
 ## [2026.10.2] - 2026-10-06
 
 ### Fixed
@@ -218,7 +228,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.2...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.3...HEAD
+[2026.10.3]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.2...v2026.10.3
 [2026.10.2]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.1...v2026.10.2
 [2026.10.1]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.0...v2026.10.1
 [2026.10.0]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.9.5...v2026.10.0
