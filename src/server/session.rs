@@ -194,6 +194,7 @@ pub async fn handle(
         reply_timeout: command_timeout,
         connect_timeout: connection_timeout,
         max_line_bytes: max_command_line_bytes,
+        fallback_to_control_ip: limits.backend_pasv_fallback_to_control_ip,
     };
 
     let backend_key = format!("{}:{}", backend_config.host, backend_config.port);

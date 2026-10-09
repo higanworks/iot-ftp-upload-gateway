@@ -1,5 +1,5 @@
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -59,6 +59,22 @@ pub struct DataConnectLimits {
     /// Longest `PASV` reply line accepted, so a backend that never sends a newline cannot make
     /// the gateway buffer without bound.
     pub max_line_bytes: usize,
+    /// Connect to the control connection's address when the backend's `PASV` reply names
+    /// `0.0.0.0` (`limits.backend_pasv_fallback_to_control_ip`).
+    pub fallback_to_control_ip: bool,
+}
+
+/// The address to connect to for a data connection whose backend announced `announced`.
+///
+/// A backend that cannot work out its own address (vsftpd with `listen_ipv6=YES`, for one)
+/// announces `0.0.0.0`, which would reach the gateway's own host. With `fallback`, the address of
+/// the control connection is used instead, as most FTP clients do. An IPv6 or unknown control
+/// address leaves the announced one as it is.
+fn data_ip(announced: Ipv4Addr, control: Option<IpAddr>, fallback: bool) -> Ipv4Addr {
+    match control {
+        Some(IpAddr::V4(control)) if fallback && announced.is_unspecified() => control,
+        _ => announced,
+    }
 }
 
 /// Asks the backend to open a passive data connection and connects to the address/port
@@ -117,12 +133,21 @@ pub async fn open_backend_data_connection(
         }
     };
 
-    let (ip, port) = parse_pasv_reply(&line).ok_or_else(|| {
+    let (announced_ip, port) = parse_pasv_reply(&line).ok_or_else(|| {
         DataConnectError::UnusableReply(anyhow!(
             "backend returned an unparsable PASV reply: {line:?}"
         ))
     })?;
 
+    let control_ip = backend_control.get_ref().peer_addr().ok().map(|a| a.ip());
+    let ip = data_ip(announced_ip, control_ip, limits.fallback_to_control_ip);
+    if ip != announced_ip {
+        tracing::warn!(
+            reply = %line.trim_end(),
+            using = %ip,
+            "backend announced 0.0.0.0 in its PASV reply; using the control connection's address instead (the backend should set its passive address, e.g. vsftpd's pasv_address)"
+        );
+    }
     let data_addr = SocketAddr::from((ip, port));
     tracing::debug!(reply = %line.trim_end(), backend_data_addr = %data_addr, "backend PASV reply");
 
@@ -318,11 +343,36 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn an_unspecified_announced_address_is_replaced_by_the_control_address() {
+        let control = Some(IpAddr::from([10, 0, 0, 5]));
+        let unspecified = Ipv4Addr::UNSPECIFIED;
+        assert_eq!(
+            data_ip(unspecified, control, true),
+            Ipv4Addr::new(10, 0, 0, 5)
+        );
+        // Switched off, or an address the backend really announced: taken literally.
+        assert_eq!(data_ip(unspecified, control, false), unspecified);
+        let announced = Ipv4Addr::new(192, 0, 2, 7);
+        assert_eq!(data_ip(announced, control, true), announced);
+        // No usable IPv4 control address to fall back to.
+        assert_eq!(data_ip(unspecified, None, true), unspecified);
+        assert_eq!(
+            data_ip(
+                unspecified,
+                Some(IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1])),
+                true
+            ),
+            unspecified
+        );
+    }
+
     fn limits() -> DataConnectLimits {
         DataConnectLimits {
             reply_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(5),
             max_line_bytes: 4096,
+            fallback_to_control_ip: true,
         }
     }
 

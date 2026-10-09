@@ -171,6 +171,7 @@ config file and overridden per-environment via env vars.
 | Max control-line length (bytes) | `limits.max_command_line_bytes` | `GATEWAY_MAX_COMMAND_LINE_BYTES` | `4096` |
 | Max concurrent connections per client IP | `limits.max_connections_per_ip` | `GATEWAY_MAX_CONNECTIONS_PER_IP` | `10` (`0` disables) |
 | Require data connection from the control connection's IP | `limits.require_data_ip_match` | `GATEWAY_REQUIRE_DATA_IP_MATCH` (`true` / `false`) | `true` |
+| Use the backend's address when its PASV reply says `0.0.0.0` | `limits.backend_pasv_fallback_to_control_ip` | `GATEWAY_BACKEND_PASV_FALLBACK_TO_CONTROL_IP` (`true` / `false`) | `true` |
 | Metrics endpoint bind address | `metrics.address` | `GATEWAY_METRICS_ADDRESS` | `127.0.0.1` |
 | Metrics endpoint port | `metrics.port` | `GATEWAY_METRICS_PORT` | *(unset — endpoint disabled)* |
 | Backend TLS mode | `backend_tls.mode` | `GATEWAY_BACKEND_TLS` (`off` / `explicit`) | `off` |
@@ -193,6 +194,13 @@ closed) once a single client IP already holds that many open — without it, one
 malicious source could open unlimited connections and exhaust file descriptors/memory on its
 own. Set to `0` to disable the check entirely. Operators behind carrier-grade NAT, where many IoT
 devices can share one public IP, should raise this or disable it.
+
+`backend_pasv_fallback_to_control_ip` (default `true`): some backends reply to `PASV` with the
+address `0.0.0.0` -- vsftpd does when it cannot work out its own address, e.g. with
+`listen_ipv6=YES`. Connecting to `0.0.0.0` reaches the gateway's own host, so the data connection
+would fail with `Connection refused`. With this option the gateway connects to the address its
+control connection goes to instead, as most FTP clients do, and logs a warning. The better fix is
+on the backend (vsftpd: `pasv_address`). Set the option to `false` to take the reply literally.
 
 `require_data_ip_match` (default `true`) only accepts a client's data connection from the same IP
 address as that client's control connection. The PASV port the gateway announces is open to the

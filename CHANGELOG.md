@@ -10,6 +10,15 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+### Added
+
+- `limits.backend_pasv_fallback_to_control_ip` (`GATEWAY_BACKEND_PASV_FALLBACK_TO_CONTROL_IP`,
+  **on by default**): when a backend's `PASV` reply names `0.0.0.0` -- vsftpd does when it cannot
+  work out its own address, e.g. with `listen_ipv6=YES` -- the gateway connects to the data port
+  at the address its control connection goes to, as most FTP clients do, and logs a warning.
+  Before, such a reply made every upload fail with `Connection refused`, because `0.0.0.0` reaches
+  the gateway's own host. Set it to `false` to take the reply literally.
+
 ## [2026.10.3] - 2026-10-09
 
 ### Changed
