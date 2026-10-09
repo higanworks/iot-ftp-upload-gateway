@@ -10,6 +10,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.10.4] - 2026-10-09
+
 ### Changed
 
 - The gateway now opens data connections to a backend with `EPSV` first (`PASV` only if the
@@ -245,7 +247,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.3...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.4...HEAD
+[2026.10.4]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.3...v2026.10.4
 [2026.10.3]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.2...v2026.10.3
 [2026.10.2]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.1...v2026.10.2
 [2026.10.1]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.0...v2026.10.1
