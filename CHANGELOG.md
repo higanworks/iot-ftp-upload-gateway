@@ -10,6 +10,14 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+### Changed
+
+- The pinned Rust toolchain moved from 1.98.1 to 1.99.1 (`rust-toolchain.toml` and the
+  `Dockerfile` builder image). No behavior change; the Rust release notes list no security fixes
+  for this range.
+- The saturating counter helper uses `AtomicU64::try_update` in place of `fetch_update`, which
+  1.99 deprecates.
+
 ## [2026.10.4] - 2026-10-09
 
 ### Changed
