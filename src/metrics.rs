@@ -310,7 +310,7 @@ fn escape_label_value(value: &str) -> String {
 /// historical total and look like a nonsensical counter reset to anything scraping it.
 fn saturating_add(counter: &AtomicU64, delta: u64) {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             Some(current.saturating_add(delta))
         })
         .ok();
