@@ -17,8 +17,15 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
   less than 3 days ago. The `Dockerfile` copies `.cargo/` too, so the image build honors it if it
   ever has to re-resolve; with an in-sync `Cargo.lock` the locked versions are used as before.
 
+- A `cargo audit` workflow (`.github/workflows/audit.yml`) checks `Cargo.lock` against the RustSec
+  advisory database on changes to the manifests and weekly. Vulnerabilities fail it; warnings such
+  as `unsafe-libyaml` being unmaintained (pulled in by `serde_yaml`) do not.
+
 ### Changed
 
+- Updated all dependencies in `Cargo.lock`. This fixes RUSTSEC-2026-0346 to -0349 (`rustls`
+  0.23.46), RUSTSEC-2026-0382 (`rustls-webpki` 0.103.16), RUSTSEC-2026-0381 (`webpki-roots`
+  1.0.11) and the RUSTSEC-2026-0386 `tokio` warning (1.54.1).
 - The pinned Rust toolchain moved from 1.99.1 to 1.100.0 (`rust-toolchain.toml` and the
   `Dockerfile` builder image). No code change was needed.
 - `samples/docker-compose.transfer-family.yml` now pins image tag `2026.10.4` (it still pointed
