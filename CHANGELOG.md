@@ -10,13 +10,14 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+## [2026.11.0] - 2026-11-13
+
 ### Added
 
 - `.cargo/config.toml` sets `registry.global-min-publish-age = "3 days"` (stable in Cargo 1.100),
   so dependency resolution (`cargo update`, new lockfile entries) skips crate versions published
   less than 3 days ago. The `Dockerfile` copies `.cargo/` too, so the image build honors it if it
   ever has to re-resolve; with an in-sync `Cargo.lock` the locked versions are used as before.
-
 - A `cargo audit` workflow (`.github/workflows/audit.yml`) checks `Cargo.lock` against the RustSec
   advisory database on changes to the manifests and weekly. Vulnerabilities fail it; warnings such
   as `unsafe-libyaml` being unmaintained (pulled in by `serde_yaml`) do not.
@@ -26,15 +27,12 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Updated all dependencies in `Cargo.lock`. This fixes RUSTSEC-2026-0346 to -0349 (`rustls`
   0.23.46), RUSTSEC-2026-0382 (`rustls-webpki` 0.103.16), RUSTSEC-2026-0381 (`webpki-roots`
   1.0.11) and the RUSTSEC-2026-0386 `tokio` warning (1.54.1).
-- The pinned Rust toolchain moved from 1.99.1 to 1.100.0 (`rust-toolchain.toml` and the
-  `Dockerfile` builder image). No code change was needed.
-- `samples/docker-compose.transfer-family.yml` now pins image tag `2026.10.4` (it still pointed
-  at `2026.10.2`). It is updated together with each release from now on.
-- The pinned Rust toolchain moved from 1.98.1 to 1.99.1 (`rust-toolchain.toml` and the
-  `Dockerfile` builder image). No behavior change; the Rust release notes list no security fixes
-  for this range.
+- The pinned Rust toolchain moved from 1.98.1 to 1.100.0 (`rust-toolchain.toml` and the
+  `Dockerfile` builder image). No behavior change.
 - The saturating counter helper uses `AtomicU64::try_update` in place of `fetch_update`, which
   1.99 deprecates.
+- `samples/docker-compose.transfer-family.yml` now pins image tag `2026.11.0` (it still pointed
+  at `2026.10.2`). It is updated together with each release from now on.
 
 ## [2026.10.4] - 2026-10-09
 
@@ -273,7 +271,8 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 - Docker multi-stage build (`rust:bookworm` -> `distroless/cc`) and a `docker-compose.yml` local
   test environment with real FTP backends.
 
-[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.4...HEAD
+[Unreleased]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.11.0...HEAD
+[2026.11.0]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.4...v2026.11.0
 [2026.10.4]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.3...v2026.10.4
 [2026.10.3]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.2...v2026.10.3
 [2026.10.2]: https://github.com/higanworks/iot-ftp-upload-gateway/compare/v2026.10.1...v2026.10.2
