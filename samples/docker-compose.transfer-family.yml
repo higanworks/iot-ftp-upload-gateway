@@ -19,7 +19,7 @@
 services:
   gateway:
     # Pin a version tag in production; tags are the release version without the leading "v".
-    image: ghcr.io/higanworks/iot-ftp-upload-gateway:2026.10.2
+    image: ghcr.io/higanworks/iot-ftp-upload-gateway:2026.10.4
 
     # Host networking lets the gateway see every address of the instance (ENIs and secondary
     # private IPs) so that backend source rotation can bind its outgoing connections to each.

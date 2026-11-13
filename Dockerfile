@@ -6,6 +6,7 @@ WORKDIR /app
 
 # Build dependencies separately so they are cached across source-only changes.
 COPY Cargo.toml Cargo.lock ./
+COPY .cargo ./.cargo
 RUN mkdir -p src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
