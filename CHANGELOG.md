@@ -10,8 +10,16 @@ original SemVer scheme, before this switch; every version from `v2026.9.0` onwar
 
 ## [Unreleased]
 
+### Added
+
+- `.cargo/config.toml` sets `registry.global-min-publish-age = "3 days"` (stable in Cargo 1.100),
+  so dependency resolution (`cargo update`, new lockfile entries) skips crate versions published
+  less than 3 days ago. `Cargo.lock` and the `Dockerfile` build are unaffected.
+
 ### Changed
 
+- The pinned Rust toolchain moved from 1.99.1 to 1.100.0 (`rust-toolchain.toml` and the
+  `Dockerfile` builder image). No code change was needed.
 - The pinned Rust toolchain moved from 1.98.1 to 1.99.1 (`rust-toolchain.toml` and the
   `Dockerfile` builder image). No behavior change; the Rust release notes list no security fixes
   for this range.
