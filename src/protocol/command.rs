@@ -155,6 +155,24 @@ mod tests {
         );
     }
 
+    /// CVE-2026-119567 (vsftpd `cmds_denied` bypass): the RFC 775 X-prefixed aliases must never
+    /// be treated as their modern equivalents -- or as anything supported -- so they fall into
+    /// the allowlist's reject path (`502`) instead of being forwarded to the Backend.
+    #[test]
+    fn legacy_x_prefixed_aliases_are_unknown() {
+        for verb in ["XMKD", "XRMD", "XCWD", "XPWD", "XCUP"] {
+            assert_eq!(
+                FtpCommand::parse(&format!("{verb} some/dir")),
+                FtpCommand::Unknown(verb.to_string()),
+                "{verb} must not be recognized"
+            );
+        }
+        assert_eq!(
+            FtpCommand::parse("xmkd some/dir"),
+            FtpCommand::Unknown("XMKD".to_string())
+        );
+    }
+
     #[test]
     fn pass_log_str_never_contains_password() {
         let command = FtpCommand::parse("PASS super-secret");
